@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>App Tray — How Icons Were Sourced</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f5f5f7; color: #1d1d1f; line-height: 1.6; padding: 40px 20px; }
+.container { max-width: 800px; margin: 0 auto; }
+h1 { font-size: 2rem; margin-bottom: 8px; }
+.subtitle { color: #6e6e73; margin-bottom: 32px; }
+.step { background: #fff; border-radius: 16px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.step-number { display: inline-block; width: 32px; height: 32px; background: #0071e3; color: #fff; border-radius: 50%; text-align: center; line-height: 32px; font-weight: 700; font-size: 14px; margin-right: 12px; }
+.step h2 { display: inline; font-size: 1.1rem; }
+.step p { margin-top: 10px; color: #424245; }
+.step .detail { margin-top: 8px; padding: 12px 16px; background: #f5f5f7; border-radius: 8px; font-family: 'Cascadia Code', monospace; font-size: 0.85rem; color: #1d1d1f; overflow-x: auto; }
+.step .comment { margin-top: 8px; padding: 10px 14px; background: #e8f5e9; border-left: 4px solid #4caf50; border-radius: 4px; font-size: 0.9rem; color: #2e7d32; }
+.icon-row { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 16px; }
+.icon-card { text-align: center; padding: 16px; background: #f5f5f7; border-radius: 12px; min-width: 100px; }
+.icon-card img { width: 64px; height: 64px; }
+.icon-card .label { margin-top: 8px; font-size: 0.8rem; color: #6e6e73; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+.badge-native { background: #e3f2fd; color: #1565c0; }
+.badge-web { background: #fff3e0; color: #e65100; }
+footer { margin-top: 40px; text-align: center; color: #6e6e73; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>How Icons Were Sourced</h1>
+<p class="subtitle">Documentation of the icon extraction process for the Windows App Tray. Every icon is real — no generated placeholders.</p>
+
+<!-- Step 1 -->
+<div class="step">
+  <span class="step-number">1</span>
+  <h2>Identify source executables</h2>
+  <p>Windows applications embed their icons directly in the .exe file. We locate each application's executable path:</p>
+  <div class="detail">
+    File Explorer → C:\Windows\explorer.exe<br>
+    Microsoft Edge → C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe<br>
+    Google Chrome → C:\Program Files\Google\Chrome\Application\chrome.exe<br>
+    Comet Browser → C:\Users\[user]\AppData\Local\Perplexity\Comet\Application\comet.exe
+  </div>
+  <div class="comment">
+    <!-- Comment: We verified each path exists using os.path.exists() before extraction.
+         Explorer is always at C:\Windows\explorer.exe on all Windows installations.
+         Edge and Chrome have standard Program Files locations.
+         Comet was found by scanning running processes via psutil — it's Perplexity's Chromium fork. -->
+  </div>
+</div>
+
+<!-- Step 2 -->
+<div class="step">
+  <span class="step-number">2</span>
+  <h2>Extract icons from .exe files</h2>
+  <p>Used <code>win32gui.ExtractIconEx()</code> from the pywin32 library to extract the primary icon from each executable as an HICON handle:</p>
+  <div class="detail">
+    import win32gui, win32ui<br>
+    large, small = win32gui.ExtractIconEx(exe_path, 0, 1)<br>
+    hicon = large[0]  # First large icon<br>
+    <br>
+    # Create a compatible DC and bitmap<br>
+    hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))<br>
+    hbmp = win32ui.CreateBitmap()<br>
+    hbmp.CreateCompatibleBitmap(hdc, 64, 64)<br>
+    <br>
+    # Draw the icon onto the bitmap<br>
+    win32gui.DrawIconEx(hdc2.GetSafeHdc(), 0, 0, hicon, 64, 64, 0, 0, 0x0003)<br>
+    <br>
+    # Convert to PIL Image via raw BGRA buffer<br>
+    img = Image.frombuffer('RGBA', (64, 64), bmpstr, 'raw', 'BGRA', 0, 1)
+  </div>
+  <div class="comment">
+    <!-- Comment: This is the native Windows API approach. No web downloads, no third-party icon packs.
+         The icons are the EXACT same pixels Windows shows in the taskbar and Start menu.
+         BGRA byte order is standard for Windows DIB sections — PIL reads it natively with the 'raw' decoder.
+         We extract at 64x64 which is the largest standard tray icon size. -->
+  </div>
+</div>
+
+<!-- Step 3 -->
+<div class="step">
+  <span class="step-number">3</span>
+  <h2>Handle web-only apps (Perplexity)</h2>
+  <p>Perplexity doesn't have a native Windows .exe — it's a web app. We fetched its favicon from the official domain:</p>
+  <div class="detail">
+    Source: https://www.perplexity.ai/favicon.ico<br>
+    Downloaded: 14.7KB .ico file<br>
+    Contains sizes: 16x16, 32x32, 48x48<br>
+    Resized to 64x64 using PIL LANCZOS resampling<br>
+    Saved as perplexity.png and perplexity.ico
+  </div>
+  <div class="comment">
+    <!-- Comment: We fetched the favicon directly from perplexity.ai — the official source.
+         The .ico format supports multiple sizes; we took the largest (48x48) and upscaled to 64x64.
+         LANCZOS resampling gives the sharpest result for upscaling small icons. -->
+  </div>
+</div>
+
+<!-- Step 4 -->
+<div class="step">
+  <span class="step-number">4</span>
+  <h2>Save in dual format</h2>
+  <p>Each icon saved as both .ico (Windows native) and .png (universal fallback):</p>
+  <div class="icon-row">
+    <div class="icon-card">
+      <img src="icons/explorer.png" alt="Explorer">
+      <div class="label">File Explorer <span class="badge badge-native">native</span></div>
+    </div>
+    <div class="icon-card">
+      <img src="icons/edge.png" alt="Edge">
+      <div class="label">Microsoft Edge <span class="badge badge-native">native</span></div>
+    </div>
+    <div class="icon-card">
+      <img src="icons/chrome.png" alt="Chrome">
+      <div class="label">Google Chrome <span class="badge badge-native">native</span></div>
+    </div>
+    <div class="icon-card">
+      <img src="icons/perplexity.png" alt="Perplexity">
+      <div class="label">Perplexity <span class="badge badge-web">favicon</span></div>
+    </div>
+    <div class="icon-card">
+      <img src="icons/comet.png" alt="Comet">
+      <div class="label">Comet Browser <span class="badge badge-native">native</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Step 5 -->
+<div class="step">
+  <span class="step-number">5</span>
+  <h2>Load into system tray</h2>
+  <p>The app reads the .ico files at startup and creates a pystray Icon for each. Real Windows icons, real tray presence.</p>
+  <div class="detail">
+    from PIL import Image<br>
+    import pystray<br>
+    <br>
+    icon_img = Image.open("icons/chrome.ico")<br>
+    tray = pystray.Icon("chrome", icon_img, "Google Chrome", menu)<br>
+    tray.run()
+  </div>
+</div>
+
+</div>
+
+<footer>
+  <p>Windows App Tray — Part of <a href="https://github.com/lozturner/lawrence-move-in">Lawrence: Move In</a></p>
+  <p>Built by Loz Turner with Claude AI assistance, April 2026</p>
+</footer>
+
+</body>
+</html>
