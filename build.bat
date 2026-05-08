@@ -39,10 +39,8 @@ if errorlevel 1 (
 )
 del "%OUT%\main.obj" 2>nul
 
-REM ----- kill any running instance -----
-taskkill /F /IM LaurenceTrayhost*.exe >nul 2>&1
-REM give the OS a moment to release tray slots
-ping -n 2 127.0.0.1 >nul
+REM ----- kill any running instance (versioned or unversioned) -----
+powershell -NoProfile -Command "Get-Process -Name 'LaurenceTrayhost*','TraySys*' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1500"
 
 REM ----- launch new version -----
 start "" "%EXE%"
