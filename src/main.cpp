@@ -37,10 +37,11 @@
 #include <mutex>
 #include <atomic>
 #include <algorithm>
+#include <random>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.3.3"
-#define TRAYSYS_VERSION_A      "0.3.3"
+#define TRAYSYS_VERSION       L"0.3.4"
+#define TRAYSYS_VERSION_A      "0.3.4"
 #define REMINDER_INTERVAL_HOURS 168                 // weekly nudge
 #define PROFILE_SLOTS          5
 #define TRAY_CALLBACK_MSG     (WM_APP + 1)
@@ -425,6 +426,50 @@ static COLORREF badgeColorForExe(const std::wstring& exeLower) {
 
 static bool isBrowserExe(const std::wstring& exe) {
     return badgeColorForExe(exe) == RGB(230, 130, 30);
+}
+
+// Coarse exe categorization for the Group / Stack action.
+// Lower number = grouped earlier in the tray.
+enum class IconCategory : int {
+    BROWSER       = 0,
+    SEARCH_AI     = 1,
+    SYSTEM        = 2,
+    PRODUCTIVITY  = 3,
+    OTHER_ACTIVE  = 4,
+    PINNED        = 5,   // greyed static launchers — always last
+};
+
+static IconCategory categorizeExe(const std::wstring& exeLower) {
+    if (isBrowserExe(exeLower)) return IconCategory::BROWSER;
+
+    static const wchar_t* search_ai[] = {
+        L"chatgpt.exe", L"claude.exe", L"copilot.exe", L"perplexity.exe",
+        L"gemini.exe",  L"groqchat.exe", L"better gpt.exe", L"chatgpt lt.exe",
+        L"chatgpt 4.exe", L"chatgpt3.exe", L"jan.exe", L"lm studio.exe",
+        L"gpt4all.exe", L"notebooklm.exe", L"google ai studio.exe",
+        L"everything.exe", L"command palette.exe"
+    };
+    for (auto* s : search_ai) if (lstrcmpiW(exeLower.c_str(), s) == 0) return IconCategory::SEARCH_AI;
+
+    static const wchar_t* system[] = {
+        L"explorer.exe", L"cmd.exe", L"powershell.exe", L"taskmgr.exe",
+        L"notepad.exe", L"calc.exe", L"calculator.exe", L"systemsettings.exe",
+        L"control.exe", L"regedit.exe", L"mmc.exe", L"snippingtool.exe",
+        L"voicerecorder.exe", L"camera.exe", L"clock.exe", L"copyq.exe",
+        L"applicationframehost.exe"
+    };
+    for (auto* s : system) if (lstrcmpiW(exeLower.c_str(), s) == 0) return IconCategory::SYSTEM;
+
+    static const wchar_t* productivity[] = {
+        L"excel.exe", L"winword.exe", L"powerpnt.exe", L"outlook.exe",
+        L"onenote.exe", L"obsidian.exe", L"notion.exe", L"anytype.exe",
+        L"affine.exe", L"cursor.exe", L"code.exe", L"vscode.exe",
+        L"telegram.exe", L"discord.exe", L"slack.exe", L"streamdeck.exe",
+        L"obs64.exe", L"audacity.exe"
+    };
+    for (auto* s : productivity) if (lstrcmpiW(exeLower.c_str(), s) == 0) return IconCategory::PRODUCTIVITY;
+
+    return IconCategory::OTHER_ACTIVE;
 }
 
 static bool isManageable(HWND h) {
@@ -959,6 +1004,77 @@ static void profileRename(int slot) {
     ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+// ---------- Group / Stack & Lucky Dip ----------
+// Tear down every per-window + pinned tray icon, then re-add them in a new
+// order. Windows shows tray icons in the order we register them (until the
+// user manually drags one).
+//
+//   mode = "group"  -> sort by category (browsers first, pinned last)
+//   mode = "random" -> Fisher-Yates shuffle
+//   mode = "uid"    -> stable original (uid ascending), used for "Reset order"
+
+enum class RearrangeMode { GROUP, RANDOM, UID };
+
+static void rearrangeIcons(RearrangeMode mode) {
+    struct Item { UINT uid; bool pinned; std::wstring exeLower; };
+    std::vector<Item> items;
+
+    {
+        std::lock_guard<std::mutex> lk(g_pinnedMx);
+        for (auto& p : g_pinned) items.push_back({p.uid, true, L""});
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_windowsMx);
+        for (auto& kv : g_windows) items.push_back({kv.second.uid, false, kv.second.exeNameLower});
+    }
+    if (items.empty()) return;
+
+    if (mode == RearrangeMode::RANDOM) {
+        std::random_device rd; std::mt19937 g(rd());
+        std::shuffle(items.begin(), items.end(), g);
+    } else if (mode == RearrangeMode::GROUP) {
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b){
+            int ac = a.pinned ? (int)IconCategory::PINNED : (int)categorizeExe(a.exeLower);
+            int bc = b.pinned ? (int)IconCategory::PINNED : (int)categorizeExe(b.exeLower);
+            if (ac != bc) return ac < bc;
+            return a.uid < b.uid;
+        });
+    } else {
+        std::sort(items.begin(), items.end(),
+                  [](const Item& a, const Item& b){ return a.uid < b.uid; });
+    }
+
+    // Tear down (NIM_DELETE for every icon in our managed set).
+    for (auto& it : items) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd   = g_msgWnd;
+        nid.uID    = it.uid;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+
+    // Re-add in the new order.
+    int reAddedPinned = 0, reAddedWin = 0;
+    for (auto& it : items) {
+        if (it.pinned) {
+            std::lock_guard<std::mutex> lk(g_pinnedMx);
+            for (auto& p : g_pinned) if (p.uid == it.uid) { pinnedTrayAdd(p); ++reAddedPinned; break; }
+        } else {
+            std::lock_guard<std::mutex> lk(g_windowsMx);
+            for (auto& kv : g_windows) if (kv.second.uid == it.uid) { trayAdd(kv.second); ++reAddedWin; break; }
+        }
+    }
+
+    const wchar_t* label = mode == RearrangeMode::GROUP  ? L"Grouped"
+                        :  mode == RearrangeMode::RANDOM ? L"Lucky dip"
+                        :                                  L"Reset order";
+    wchar_t body[200];
+    swprintf(body, 200, L"%d windows + %d pinned icons re-registered.", reAddedWin, reAddedPinned);
+    trayBalloon(MASTER_TRAY_UID, label, body);
+    logf("rearrangeIcons mode=%d: %d windows + %d pinned re-registered",
+         (int)mode, reAddedWin, reAddedPinned);
+}
+
 static void showContextMenuFor(UINT uid) {
     POINT pt; GetCursorPos(&pt);
     SetForegroundWindow(g_msgWnd);
@@ -990,6 +1106,10 @@ static void showContextMenuFor(UINT uid) {
         AppendMenuW(profMenu, MF_POPUP, (UINT_PTR)snapMenu,  L"Snapshot current →");
         AppendMenuW(profMenu, MF_POPUP, (UINT_PTR)applyMenu, L"Apply profile →");
         AppendMenuW(profMenu, MF_POPUP, (UINT_PTR)nameMenu,  L"Rename →");
+        AppendMenuW(profMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(profMenu, MF_STRING, 1400, L"Group / stack icons (browsers → search → system → other → pinned)");
+        AppendMenuW(profMenu, MF_STRING, 1401, L"Lucky dip (random shuffle)");
+        AppendMenuW(profMenu, MF_STRING, 1402, L"Reset order (original)");
 
         // ----- master star icon menu -----
         bool autostart = autostartIsEnabled();
@@ -1019,6 +1139,9 @@ static void showContextMenuFor(UINT uid) {
         else if (cmd >= 1100 && cmd < 1100 + PROFILE_SLOTS + 1) profileSnapshot(cmd - 1100);
         else if (cmd >= 1200 && cmd < 1200 + PROFILE_SLOTS + 1) profileApply(cmd - 1200);
         else if (cmd >= 1300 && cmd < 1300 + PROFILE_SLOTS + 1) profileRename(cmd - 1300);
+        else if (cmd == 1400) rearrangeIcons(RearrangeMode::GROUP);
+        else if (cmd == 1401) rearrangeIcons(RearrangeMode::RANDOM);
+        else if (cmd == 1402) rearrangeIcons(RearrangeMode::UID);
         else switch (cmd) {
             case 1000: actionMasterReset();   break;
             case 1001: actionCloseAll();      break;
