@@ -19,3 +19,8 @@ traysys.log
 *.swp
 .DS_Store
 Thumbs.db
+
+# legacy python remnants
+__pycache__/
+*.pyc
+app_tray_config.json

@@ -46,7 +46,7 @@ Settings UI: <http://127.0.0.1:8731/>
 Single C++17 file. Three threads:
 
 1. **Main / message thread** — pumps Win32 messages, handles tray callbacks (click → focus, dblclick → toggle minimise, etc.)
-2. **Refresh thread** — every ~1s: `EnumWindows` → diff against tracked map → `Shell_NotifyIcon NIM_ADD/MODIFY/DELETE`. Decoupled from the message loop because Shell_NotifyIcon can block on a busy shell.
+2. **Refresh thread** — every ~1s: `EnumWindows` → diff against tracked map → `Shell_NotifyIcon NIM_ADD/MODIFY/DELETE`. Decoupled from the message loop because `Shell_NotifyIcon` can block on a busy shell.
 3. **HTTP thread** — winsock listener on `127.0.0.1:8731`, serves `/`, `/api/state`, `/api/refresh`, `/api/quit`.
 
 Singleton enforced via named mutex.
@@ -64,3 +64,11 @@ Baseline (v0.1.1, 14 windows):
 - Steady-state refresh: 1–5 ms
 - RSS: 8–9 MB
 - CPU idle: 0%
+
+## Legacy Python prototype
+
+The previous `pystray`-based prototype (fixed-icon launcher) lives in [`legacy_python/`](legacy_python/) — preserved for the icon-extraction work. The C++ Trayhost replaces it: instead of a fixed set of launcher icons, every active window gets its own.
+
+## Part of
+
+[Lawrence: Move In](https://github.com/lozturner/lawrence-move-in) — Loz's Windows productivity suite.
