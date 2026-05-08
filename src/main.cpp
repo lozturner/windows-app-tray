@@ -40,8 +40,9 @@
 #include <random>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.3.4"
-#define TRAYSYS_VERSION_A      "0.3.4"
+#define TRAYSYS_VERSION       L"0.3.5"
+#define TRAYSYS_VERSION_A      "0.3.5"
+#define TIMER_DEBOUNCE_REFRESH 7
 #define REMINDER_INTERVAL_HOURS 168                 // weekly nudge
 #define PROFILE_SLOTS          5
 #define TRAY_CALLBACK_MSG     (WM_APP + 1)
@@ -102,6 +103,29 @@ static bool autostartIsEnabled() {
     bool found = (RegQueryValueExW(h, AUTOSTART_NAME, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS);
     RegCloseKey(h);
     return found;
+}
+
+static int  clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Forward decls — actual atomic globals defined further down with the rest of
+// the runtime state. This lets the load/save helpers live in the INI block.
+extern std::atomic<int> g_refreshIntervalMs;
+extern std::atomic<int> g_debounceMs;
+extern std::atomic<int> g_starAnimMs;
+
+static void tuningLoad() {
+    g_refreshIntervalMs.store(clampInt(iniGetInt("tuning", "refresh_interval_ms", 5000), 500, 60000));
+    g_debounceMs.store       (clampInt(iniGetInt("tuning", "debounce_ms",          150),  20,  2000));
+    g_starAnimMs.store       (clampInt(iniGetInt("tuning", "star_anim_ms",         140),   0,  5000));
+}
+static void tuningSave() {
+    char b[32];
+    snprintf(b, 32, "%d", g_refreshIntervalMs.load());
+    WritePrivateProfileStringA("tuning", "refresh_interval_ms", b, g_iniPath);
+    snprintf(b, 32, "%d", g_debounceMs.load());
+    WritePrivateProfileStringA("tuning", "debounce_ms", b, g_iniPath);
+    snprintf(b, 32, "%d", g_starAnimMs.load());
+    WritePrivateProfileStringA("tuning", "star_anim_ms", b, g_iniPath);
 }
 
 static void autostartSet(bool on) {
@@ -203,6 +227,16 @@ static std::atomic<bool>       g_hideAllFromTaskbar{true};      // default: full
 // shell starts/restarts. We re-register every tray icon when it arrives,
 // which is THE fix for the "icons go blank until you hover" Windows quirk.
 static UINT                    g_taskbarCreatedMsg = 0;
+
+// Live-tunable timings (default values; overridden from INI [tuning] at startup;
+// settings UI sliders update these live via /api/tuning POST).
+static std::atomic<int>        g_refreshIntervalMs{5000};   // safety-net poll
+static std::atomic<int>        g_debounceMs{150};           // event-burst coalesce
+static std::atomic<int>        g_starAnimMs{140};           // 0 = stop animation
+
+// Per-window event hook (WinEvents) — replaces polling-as-primary with
+// "react when Windows tells us a window changed".
+static HWINEVENTHOOK           g_winEventHook = nullptr;
 
 // COM ITaskbarList for AddTab/DeleteTab — hide browser windows from the real taskbar.
 // MUST only be touched from the main message thread (the COM apartment that created it).
@@ -1286,6 +1320,13 @@ button:hover{background:#222}
   </label>
 </div>
 
+<h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Timings (live — saved instantly)</h2>
+<p style="color:#888;font-size:12px;margin:0 0 14px;line-height:1.5">
+v0.3.5 reacts to Windows window-events in real time, so polling is just a safety-net.
+Lower the poll for snappier; raise it if you see flicker. Debounce coalesces bursts of events into a single refresh.
+</p>
+<div id="tuning" style="display:grid;grid-template-columns:200px 1fr 80px;gap:10px 16px;align-items:center;margin-bottom:24px"></div>
+
 <h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Profiles</h2>
 <div id="profiles"></div>
 
@@ -1343,7 +1384,33 @@ async function renameProfile(input){
 }
 async function r(){ await fetch('/api/refresh',{method:'POST'}); load(); }
 async function q(){ if(confirm('Quit Laurence Trayhost and remove all tray icons?')) await fetch('/api/quit',{method:'POST'}); }
-load(); loadAutostart(); loadProfiles();
+async function loadTuning(){
+  const r = await fetch('/api/tuning').then(x=>x.json());
+  const sliders = [
+    {key:'refresh_interval_ms', label:'Safety-net poll',  min:500, max:30000, step:250, val:r.refresh_interval_ms, suf:'ms'},
+    {key:'debounce_ms',         label:'Event debounce',   min:20,  max:1000,  step:10,  val:r.debounce_ms,         suf:'ms'},
+    {key:'star_anim_ms',        label:'Star animation',   min:0,   max:1500,  step:20,  val:r.star_anim_ms,        suf:'ms (0 = off)'},
+  ];
+  const wrap = document.getElementById('tuning');
+  wrap.innerHTML = sliders.map(s=>`
+    <label style="color:#bbb">${s.label}</label>
+    <input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${s.val}"
+           data-key="${s.key}" oninput="onSlide(this)" onchange="saveTuning()"
+           style="background:#1a1a1a">
+    <span data-suffix="${s.key}" style="color:#9ad;font-variant-numeric:tabular-nums">${s.val}${s.suf}</span>
+  `).join('');
+}
+function onSlide(input){
+  const key = input.dataset.key;
+  const span = document.querySelector('[data-suffix="'+key+'"]');
+  span.textContent = input.value + (key==='star_anim_ms' ? 'ms (0 = off)' : 'ms');
+}
+async function saveTuning(){
+  const body = Array.from(document.querySelectorAll('#tuning input')).
+    map(i=>i.dataset.key+'='+i.value).join('&');
+  await fetch('/api/tuning',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+}
+load(); loadAutostart(); loadProfiles(); loadTuning();
 setInterval(load, 1500);
 </script>
 )HTML";
@@ -1492,6 +1559,35 @@ static void httpHandle(SOCKET s) {
         bool on = body && strstr(body, "enabled=1");
         autostartSet(on);
         httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
+    } else if (strcmp(path, "/api/tuning") == 0 && strcmp(method, "GET") == 0) {
+        char j[256];
+        snprintf(j, sizeof(j),
+            "{\"refresh_interval_ms\":%d,\"debounce_ms\":%d,\"star_anim_ms\":%d}",
+            g_refreshIntervalMs.load(), g_debounceMs.load(), g_starAnimMs.load());
+        httpRespond(s, "200 OK", "application/json", j);
+    } else if (strcmp(path, "/api/tuning") == 0 && strcmp(method, "POST") == 0) {
+        const char* body = strstr(buf, "\r\n\r\n");
+        if (body) {
+            body += 4;
+            auto getInt = [&](const char* key, int& out) {
+                const char* p = strstr(body, key);
+                if (!p) return;
+                p += strlen(key);
+                if (*p != '=') return;
+                out = atoi(p + 1);
+            };
+            int r = g_refreshIntervalMs.load();
+            int d = g_debounceMs.load();
+            int s = g_starAnimMs.load();
+            getInt("refresh_interval_ms", r);
+            getInt("debounce_ms",          d);
+            getInt("star_anim_ms",         s);
+            g_refreshIntervalMs.store(clampInt(r,  500, 60000));
+            g_debounceMs.store       (clampInt(d,   20,  2000));
+            g_starAnimMs.store       (clampInt(s,    0,  5000));
+            tuningSave();
+        }
+        httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
     } else {
         httpRespond(s, "404 Not Found", "text/plain", std::string("not found"));
     }
@@ -1524,6 +1620,36 @@ static void httpServerThread() {
     }
     closesocket(ls);
     WSACleanup();
+}
+
+// ---------- WinEvent hook: event-driven refresh ----------
+// Windows fires these for every window create/destroy/show/hide/name-change.
+// Hooking them lets us react in real time instead of polling, and we
+// debounce so a burst of events (e.g. an app launching) coalesces into one
+// refresh.
+
+static std::atomic<long long> g_lastEventMs{0};
+
+static void CALLBACK winEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                  LONG idObject, LONG idChild,
+                                  DWORD, DWORD) {
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (!hwnd || GetWindow(hwnd, GW_OWNER) != nullptr) return;
+    g_lastEventMs.store(nowMs());
+    // Tell the message thread to (re-)arm the debounce timer.
+    PostMessageW(g_msgWnd, WM_APP + 5, 0, 0);
+}
+
+static void winEventInstall() {
+    g_winEventHook = SetWinEventHook(
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        nullptr, winEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    logf("WinEvent hook installed: %p", g_winEventHook);
+}
+static void winEventUninstall() {
+    if (g_winEventHook) UnhookWinEvent(g_winEventHook);
+    g_winEventHook = nullptr;
 }
 
 // ---------- re-register every tray icon (used after TaskbarCreated) ----------
@@ -1626,8 +1752,18 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP + 4:                  // animation tick — advance master star frame
         masterTrayAnimate();
         return 0;
+    case WM_APP + 5:                  // a WinEvent fired — arm/re-arm debounce
+        SetTimer(h, TIMER_DEBOUNCE_REFRESH, g_debounceMs.load(), nullptr);
+        return 0;
+    case WM_TIMER:
+        if (w == TIMER_DEBOUNCE_REFRESH) {
+            KillTimer(h, TIMER_DEBOUNCE_REFRESH);
+            refreshWindows();          // event-driven coalesced refresh
+        }
+        return 0;
     case WM_DESTROY:
         g_quit.store(true);
+        winEventUninstall();
         masterTrayUnregister();
         unregisterAllPinned();
         // remove all our tray icons + restore any taskbar slots we hid
@@ -1689,6 +1825,12 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     ChangeWindowMessageFilterEx(g_msgWnd, g_taskbarCreatedMsg, MSGFLT_ALLOW, nullptr);
     logf("TaskbarCreated msg registered (id=%u)", g_taskbarCreatedMsg);
 
+    tuningLoad();
+    logf("tuning: refresh=%dms debounce=%dms star=%dms",
+         g_refreshIntervalMs.load(), g_debounceMs.load(), g_starAnimMs.load());
+
+    winEventInstall();
+
     // Load animated star frames + register the master tray icon BEFORE the
     // first refresh so the right-click menu is available immediately.
     loadStarFrames();
@@ -1714,11 +1856,12 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         }
     }
 
-    // Refresh on a dedicated worker thread, NOT WM_TIMER —
-    // Shell_NotifyIcon can block, and a wedged message thread kills tray callbacks.
+    // Safety-net polling. Most refreshes are now event-driven (WinEventHook
+    // → debounce → refresh). This thread covers anything events miss.
     std::thread refreshThread([]{
         while (!g_quit.load()) {
-            for (int i = 0; i < REFRESH_INTERVAL_MS / 50 && !g_quit.load(); ++i)
+            int total = g_refreshIntervalMs.load();
+            for (int i = 0; i < total / 50 && !g_quit.load(); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             if (g_quit.load()) break;
             refreshWindows();
@@ -1727,12 +1870,17 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     logf("refresh thread spawned");
 
     // Animation thread — cycles the master star icon through colour frames.
+    // g_starAnimMs == 0 pauses animation entirely (still polled at 250ms so
+    // the slider can re-enable it instantly).
     std::thread starAnimThread([]{
         while (!g_quit.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(STAR_ANIM_INTERVAL_MS));
+            int sleep = g_starAnimMs.load();
+            if (sleep <= 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep));
             if (g_quit.load()) break;
-            // Drive the animation from the main thread to avoid Shell_NotifyIcon
-            // races; PostMessage is cheap.
             PostMessageW(g_msgWnd, WM_APP + 4, 0, 0);
         }
     });
