@@ -24,6 +24,9 @@ set "OUT=C:\LaurenceTrayhost"
 set "EXE=%OUT%\LaurenceTrayhost_v%VER%.exe"
 if not exist "%OUT%" mkdir "%OUT%"
 
+REM ----- kill any running instance BEFORE compiling so link.exe can overwrite -----
+powershell -NoProfile -Command "Get-Process -Name 'LaurenceTrayhost*','TraySys*' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1200"
+
 REM ----- compile -----
 cl.exe /nologo /std:c++17 /O2 /EHsc /W3 /MT ^
     /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
@@ -31,16 +34,13 @@ cl.exe /nologo /std:c++17 /O2 /EHsc /W3 /MT ^
     /Fo"%OUT%\\" /Fe"%EXE%" ^
     /link /SUBSYSTEM:WINDOWS ^
     user32.lib gdi32.lib shell32.lib shlwapi.lib ^
-    psapi.lib dwmapi.lib ole32.lib ws2_32.lib advapi32.lib >nul
+    psapi.lib dwmapi.lib ole32.lib ws2_32.lib advapi32.lib uuid.lib
 
 if errorlevel 1 (
     echo BUILD FAILED.
     exit /b 1
 )
 del "%OUT%\main.obj" 2>nul
-
-REM ----- kill any running instance (versioned or unversioned) -----
-powershell -NoProfile -Command "Get-Process -Name 'LaurenceTrayhost*','TraySys*' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1500"
 
 REM ----- launch new version -----
 start "" "%EXE%"

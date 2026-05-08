@@ -16,13 +16,15 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <psapi.h>
 #include <dwmapi.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include <shobjidl.h>
+#include <objbase.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -34,10 +36,11 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.1.1"
-#define TRAYSYS_VERSION_A      "0.1.1"
+#define TRAYSYS_VERSION       L"0.2.0"
+#define TRAYSYS_VERSION_A      "0.2.0"
 #define TRAY_CALLBACK_MSG     (WM_APP + 1)
 #define HTTP_PORT             8731
 #define REFRESH_INTERVAL_MS   1000
@@ -114,10 +117,13 @@ static size_t rssKB() {
 struct ManagedWindow {
     HWND     hwnd;
     UINT     uid;          // tray icon ID (stable within process lifetime)
-    HICON    icon;         // copied — we own and DestroyIcon on remove
+    HICON    rawIcon;      // unbadged source icon (we own — DestroyIcon on remove)
+    HICON    badgedIcon;   // composited icon currently shown (we own — DestroyIcon on replace)
+    int      badgeNum = 0; // 1..N if N windows share this exe; 0 means no badge needed
     std::wstring title;
-    std::wstring exeName;
-    bool     dirty = false;
+    std::wstring exeName;       // lower-case basename
+    std::wstring exeNameLower;
+    bool     hiddenFromTaskbar = false;  // tracked so we know whether to call DeleteTab
 };
 
 static std::unordered_map<HWND, ManagedWindow> g_windows;
@@ -131,6 +137,35 @@ static std::unordered_map<UINT, HWND>          g_uidToHwnd;
 // last refresh stats for /status endpoint
 static std::atomic<long long>  g_lastRefreshMs{0};
 static std::atomic<double>     g_lastRefreshDuration{0.0};
+
+// runtime flags (settable via /api/config in a future patch)
+static std::atomic<bool>       g_hideBrowsersFromTaskbar{true};
+
+// COM ITaskbarList for AddTab/DeleteTab — hide browser windows from the real taskbar.
+// MUST only be touched from the main message thread (the COM apartment that created it).
+static ITaskbarList*           g_taskbarList = nullptr;
+#define WM_TBL_SETVISIBLE      (WM_APP + 3)        // wParam = hwnd, lParam = visible
+
+static void taskbarListInit() {
+    if (g_taskbarList) return;
+    HRESULT hr = CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_ITaskbarList, (void**)&g_taskbarList);
+    if (SUCCEEDED(hr) && g_taskbarList) g_taskbarList->HrInit();
+}
+
+// Direct call (main thread only).
+static void taskbarListSetVisibleDirect(HWND h, bool visible) {
+    if (!g_taskbarList) return;
+    if (visible) g_taskbarList->AddTab(h);
+    else         g_taskbarList->DeleteTab(h);
+}
+
+// Thread-safe wrapper: posts a message to the main thread so the call happens
+// in the COM apartment that owns g_taskbarList.
+static void taskbarListSetVisible(HWND h, bool visible) {
+    if (!g_msgWnd) { taskbarListSetVisibleDirect(h, visible); return; }
+    PostMessageW(g_msgWnd, WM_TBL_SETVISIBLE, (WPARAM)h, visible ? 1 : 0);
+}
 
 // ---------- util ----------
 static std::wstring exeBasenameForHwnd(HWND h) {
@@ -169,6 +204,118 @@ static HICON copyIconForHwnd(HWND h) {
     return CopyIcon(src);
 }
 
+// Draw a small filled circle with a number on top of the source icon.
+// Returns a brand-new HICON (caller owns and must DestroyIcon).
+// badgeColor encoded as 0x00BBGGRR (Win32 COLORREF).
+static HICON makeBadgedIcon(HICON src, int number, COLORREF badgeColor) {
+    if (!src || number <= 0) return CopyIcon(src);
+
+    const int sz = 32;
+    HDC screen = GetDC(nullptr);
+    HDC mem    = CreateCompatibleDC(screen);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = sz;
+    bmi.bmiHeader.biHeight      = -sz;          // top-down DIB
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP mask  = CreateBitmap(sz, sz, 1, 1, nullptr);
+
+    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, color);
+
+    // 1) draw the source icon (preserves alpha)
+    DrawIconEx(mem, 0, 0, src, sz, sz, 0, nullptr, DI_NORMAL);
+
+    // 2) badge: filled circle bottom-right with white outline,
+    //    sized large so it stays visible when Windows downsamples the icon
+    //    from 32x32 to 16x16 in the notification area.
+    int br = 11;                            // radius
+    int cx = sz - br, cy = sz - br;
+
+    // white outer ring (3px thick) for contrast
+    HBRUSH ringBrush = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN   ringPen   = CreatePen(PS_NULL, 0, 0);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(mem, ringBrush);
+    HPEN   oldPen   = (HPEN)SelectObject(mem, ringPen);
+    Ellipse(mem, cx - br, cy - br, cx + br, cy + br);
+    SelectObject(mem, oldBrush);
+    SelectObject(mem, oldPen);
+    DeleteObject(ringBrush);
+    DeleteObject(ringPen);
+
+    // coloured fill, slightly smaller
+    int fr = br - 2;
+    HBRUSH bg = CreateSolidBrush(badgeColor);
+    HPEN   bgPen = CreatePen(PS_NULL, 0, 0);
+    oldBrush = (HBRUSH)SelectObject(mem, bg);
+    oldPen   = (HPEN)SelectObject(mem, bgPen);
+    Ellipse(mem, cx - fr, cy - fr, cx + fr, cy + fr);
+    SelectObject(mem, oldBrush);
+    SelectObject(mem, oldPen);
+    DeleteObject(bg);
+    DeleteObject(bgPen);
+
+    // 3) number on top — bold sans, scaled with badge
+    HFONT font = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT oldFont = (HFONT)SelectObject(mem, font);
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(255, 255, 255));
+    wchar_t buf[8]; swprintf(buf, 8, L"%d", number > 9 ? 9 : number);  // single digit fits cleanly
+    RECT r = { cx - br, cy - br, cx + br, cy + br };
+    DrawTextW(mem, buf, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mem, oldFont);
+    DeleteObject(font);
+
+    // 4) restore alpha on the badge area — Ellipse on a 32-bit DIB clears alpha to 0,
+    //    which makes the badge transparent. Force alpha=255 inside the badge bbox.
+    auto* pixels = static_cast<unsigned char*>(bits);
+    int x0 = cx - br - 1, y0 = cy - br - 1;
+    int x1 = cx + br + 1, y1 = cy + br + 1;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > sz) x1 = sz; if (y1 > sz) y1 = sz;
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+            pixels[(y * sz + x) * 4 + 3] = 255;
+
+    SelectObject(mem, oldBmp);
+
+    ICONINFO ii{};
+    ii.fIcon    = TRUE;
+    ii.hbmColor = color;
+    ii.hbmMask  = mask;
+    HICON out = CreateIconIndirect(&ii);
+
+    DeleteObject(color);
+    DeleteObject(mask);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return out;
+}
+
+// Classify exe name: returns badge color for distinguishing categories.
+//   browsers -> amber/orange (so duplicates of Chrome look like browser-tabs)
+//   default  -> blue
+static COLORREF badgeColorForExe(const std::wstring& exeLower) {
+    static const wchar_t* browsers[] = {
+        L"chrome.exe", L"msedge.exe", L"comet.exe", L"firefox.exe",
+        L"brave.exe", L"opera.exe", L"vivaldi.exe", L"arc.exe"
+    };
+    for (const wchar_t* b : browsers)
+        if (lstrcmpiW(exeLower.c_str(), b) == 0) return RGB(230, 130, 30);  // amber
+    return RGB(40, 130, 220);  // blue
+}
+
+static bool isBrowserExe(const std::wstring& exe) {
+    return badgeColorForExe(exe) == RGB(230, 130, 30);
+}
+
 static bool isManageable(HWND h) {
     if (!IsWindowVisible(h)) return false;
     if (GetWindow(h, GW_OWNER) != nullptr) return false;
@@ -190,6 +337,17 @@ static bool isManageable(HWND h) {
 }
 
 // ---------- tray-icon CRUD ----------
+// Apply the current m.badgeNum to m.badgedIcon (regenerating from m.rawIcon).
+static void rebakeBadge(ManagedWindow& m) {
+    if (m.badgedIcon) { DestroyIcon(m.badgedIcon); m.badgedIcon = nullptr; }
+    if (m.badgeNum > 0) {
+        m.badgedIcon = makeBadgedIcon(m.rawIcon, m.badgeNum,
+                                      badgeColorForExe(m.exeNameLower));
+    } else {
+        m.badgedIcon = CopyIcon(m.rawIcon);
+    }
+}
+
 static bool trayAdd(ManagedWindow& m) {
     NOTIFYICONDATAW nid{};
     nid.cbSize           = sizeof(nid);
@@ -197,7 +355,7 @@ static bool trayAdd(ManagedWindow& m) {
     nid.uID              = m.uid;
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = TRAY_CALLBACK_MSG;
-    nid.hIcon            = m.icon;
+    nid.hIcon            = m.badgedIcon;
     std::wstring tip = m.title;
     if (tip.size() > 127) tip.resize(127);
     lstrcpynW(nid.szTip, tip.c_str(), 128);
@@ -214,10 +372,23 @@ static void trayModify(ManagedWindow& m) {
     nid.hWnd   = g_msgWnd;
     nid.uID    = m.uid;
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    nid.hIcon  = m.icon;
+    nid.hIcon  = m.badgedIcon;
     std::wstring tip = m.title;
     if (tip.size() > 127) tip.resize(127);
     lstrcpynW(nid.szTip, tip.c_str(), 128);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+// Show a one-shot Windows toast/balloon, attached to one of our existing tray icons.
+static void trayBalloon(UINT uid, const wchar_t* title, const wchar_t* body) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = g_msgWnd;
+    nid.uID    = uid;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+    lstrcpynW(nid.szInfoTitle, title, 64);
+    lstrcpynW(nid.szInfo,      body,  256);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -257,8 +428,11 @@ static void refreshWindows() {
         // remove gone
         for (auto it = g_windows.begin(); it != g_windows.end(); ) {
             if (seen.find(it->first) == seen.end()) {
+                if (it->second.hiddenFromTaskbar)
+                    taskbarListSetVisible(it->second.hwnd, true);  // restore taskbar slot
                 trayDelete(it->second);
-                if (it->second.icon) DestroyIcon(it->second.icon);
+                if (it->second.rawIcon)    DestroyIcon(it->second.rawIcon);
+                if (it->second.badgedIcon) DestroyIcon(it->second.badgedIcon);
                 g_uidToHwnd.erase(it->second.uid);
                 it = g_windows.erase(it);
                 ++removed;
@@ -270,17 +444,28 @@ static void refreshWindows() {
             auto it = g_windows.find(h);
             if (it == g_windows.end()) {
                 ManagedWindow m;
-                m.hwnd    = h;
-                m.uid     = g_nextUid++;
-                m.icon    = copyIconForHwnd(h);
-                m.title   = titleOf(h);
-                m.exeName = exeBasenameForHwnd(h);
+                m.hwnd         = h;
+                m.uid          = g_nextUid++;
+                m.rawIcon      = copyIconForHwnd(h);
+                m.badgedIcon   = CopyIcon(m.rawIcon);  // initial: unbadged
+                m.title        = titleOf(h);
+                std::wstring exe = exeBasenameForHwnd(h);
+                m.exeName      = exe;
+                m.exeNameLower = exe;
+                std::transform(m.exeNameLower.begin(), m.exeNameLower.end(),
+                               m.exeNameLower.begin(), ::towlower);
                 if (trayAdd(m)) {
                     g_uidToHwnd[m.uid] = h;
-                    g_windows.emplace(h, std::move(m));
+                    auto [ins, _] = g_windows.emplace(h, std::move(m));
+                    // hide browser window from real taskbar if configured
+                    if (g_hideBrowsersFromTaskbar.load() && isBrowserExe(ins->second.exeNameLower)) {
+                        taskbarListSetVisible(h, false);
+                        ins->second.hiddenFromTaskbar = true;
+                    }
                     ++added;
                 } else {
-                    if (m.icon) DestroyIcon(m.icon);
+                    if (m.rawIcon)    DestroyIcon(m.rawIcon);
+                    if (m.badgedIcon) DestroyIcon(m.badgedIcon);
                     logf("trayAdd failed for hwnd=%p uid=%u", h, (unsigned)m.uid);
                 }
             } else {
@@ -288,6 +473,26 @@ static void refreshWindows() {
                 if (t != it->second.title) {
                     it->second.title = std::move(t);
                     trayModify(it->second);
+                }
+            }
+        }
+
+        // ----- recompute per-exe badge indices and re-bake icons where they changed -----
+        std::unordered_map<std::wstring, std::vector<ManagedWindow*>> byExe;
+        for (auto& kv : g_windows) byExe[kv.second.exeNameLower].push_back(&kv.second);
+
+        for (auto& kv : byExe) {
+            auto& vec = kv.second;
+            // stable order by uid so badge numbers don't reshuffle on every tick
+            std::sort(vec.begin(), vec.end(),
+                      [](ManagedWindow* a, ManagedWindow* b){ return a->uid < b->uid; });
+            int n = (int)vec.size();
+            for (int i = 0; i < n; ++i) {
+                int wantBadge = (n > 1) ? (i + 1) : 0;
+                if (vec[i]->badgeNum != wantBadge) {
+                    vec[i]->badgeNum = wantBadge;
+                    rebakeBadge(*vec[i]);
+                    trayModify(*vec[i]);
                 }
             }
         }
@@ -557,14 +762,20 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP + 2:                  // refresh requested via HTTP
         refreshWindows();
         return 0;
+    case WM_TBL_SETVISIBLE:           // (HWND, bool) - only main thread touches g_taskbarList
+        taskbarListSetVisibleDirect((HWND)w, l != 0);
+        return 0;
     case WM_DESTROY:
         g_quit.store(true);
-        // remove all our tray icons
+        // remove all our tray icons + restore any taskbar slots we hid
         {
             std::lock_guard<std::mutex> lk(g_windowsMx);
             for (auto& kv : g_windows) {
+                if (kv.second.hiddenFromTaskbar)
+                    taskbarListSetVisible(kv.second.hwnd, true);
                 trayDelete(kv.second);
-                if (kv.second.icon) DestroyIcon(kv.second.icon);
+                if (kv.second.rawIcon)    DestroyIcon(kv.second.rawIcon);
+                if (kv.second.badgedIcon) DestroyIcon(kv.second.badgedIcon);
             }
             g_windows.clear();
             g_uidToHwnd.clear();
@@ -578,10 +789,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // ---------- entry ----------
 int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     g_startMs = nowMs();
     resolveDataPaths();
     benchHeader();
     logf("--- TraySys %ls start (pid=%lu) ---", TRAYSYS_VERSION, GetCurrentProcessId());
+    taskbarListInit();
 
     // Single-instance guard so we never double-register tray icons
     HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\TraySys.singleton.v1");
@@ -611,6 +824,19 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     logf("calling initial refreshWindows...");
     refreshWindows();
     logf("initial refreshWindows done, icons=%zu", g_windows.size());
+
+    // launch notification — balloon attached to the first registered icon
+    {
+        std::lock_guard<std::mutex> lk(g_windowsMx);
+        if (!g_windows.empty()) {
+            UINT firstUid = g_windows.begin()->second.uid;
+            wchar_t body[200];
+            swprintf(body, 200,
+                L"Tracking %zu windows. Click an icon to focus, double-click to minimise/restore. Settings: http://127.0.0.1:%d/",
+                g_windows.size(), HTTP_PORT);
+            trayBalloon(firstUid, L"Laurence Trayhost " TRAYSYS_VERSION L" running", body);
+        }
+    }
 
     // Refresh on a dedicated worker thread, NOT WM_TIMER —
     // Shell_NotifyIcon can block, and a wedged message thread kills tray callbacks.
