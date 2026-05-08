@@ -39,11 +39,15 @@
 #include <algorithm>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.2.0"
-#define TRAYSYS_VERSION_A      "0.2.0"
+#define TRAYSYS_VERSION       L"0.3.0"
+#define TRAYSYS_VERSION_A      "0.3.0"
 #define TRAY_CALLBACK_MSG     (WM_APP + 1)
 #define HTTP_PORT             8731
 #define REFRESH_INTERVAL_MS   1000
+#define MASTER_TRAY_UID       0x7000             // dedicated UID for the animated master icon
+#define STAR_FRAME_COUNT      8
+#define STAR_FRAME_BASE_RES   100                // resource IDs 100..107
+#define STAR_ANIM_INTERVAL_MS 140                // ~7 fps colour cycle
 
 // ---------- log + bench ----------
 // Paths resolved at startup to be next to the .exe so we never lose them to a weird CWD.
@@ -379,6 +383,67 @@ static void trayModify(ManagedWindow& m) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// ---------- master tray icon (the animated star) ----------
+static HICON g_starFrames[STAR_FRAME_COUNT] = {};
+static std::atomic<int> g_starFrameIdx{0};
+static std::atomic<bool> g_masterRegistered{false};
+
+static void loadStarFrames() {
+    HMODULE mod = GetModuleHandleW(nullptr);
+    int wantedSize = GetSystemMetrics(SM_CXSMICON);   // 16 on stock DPI
+    if (wantedSize <= 0) wantedSize = 16;
+    for (int i = 0; i < STAR_FRAME_COUNT; ++i) {
+        g_starFrames[i] = (HICON)LoadImageW(
+            mod, MAKEINTRESOURCEW(STAR_FRAME_BASE_RES + i),
+            IMAGE_ICON, wantedSize, wantedSize, LR_DEFAULTCOLOR);
+        if (!g_starFrames[i])
+            g_starFrames[i] = (HICON)LoadImageW(
+                mod, MAKEINTRESOURCEW(STAR_FRAME_BASE_RES + i),
+                IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+    }
+}
+
+static void masterTrayRegister() {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize           = sizeof(nid);
+    nid.hWnd             = g_msgWnd;
+    nid.uID              = MASTER_TRAY_UID;
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    nid.uCallbackMessage = TRAY_CALLBACK_MSG;
+    nid.hIcon            = g_starFrames[0] ? g_starFrames[0] : LoadIcon(nullptr, IDI_APPLICATION);
+    lstrcpynW(nid.szTip, L"Laurence Trayhost " TRAYSYS_VERSION L" — right-click for menu", 128);
+    if (Shell_NotifyIconW(NIM_ADD, &nid) == TRUE) {
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        g_masterRegistered.store(true);
+    }
+}
+
+static void masterTrayAnimate() {
+    if (!g_masterRegistered.load()) return;
+    int idx = (g_starFrameIdx.fetch_add(1) + 1) % STAR_FRAME_COUNT;
+    HICON h = g_starFrames[idx];
+    if (!h) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = g_msgWnd;
+    nid.uID    = MASTER_TRAY_UID;
+    nid.uFlags = NIF_ICON;
+    nid.hIcon  = h;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+static void masterTrayUnregister() {
+    if (!g_masterRegistered.load()) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd   = g_msgWnd;
+    nid.uID    = MASTER_TRAY_UID;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    g_masterRegistered.store(false);
+}
+
+// ---------- balloon helper ----------
 // Show a one-shot Windows toast/balloon, attached to one of our existing tray icons.
 static void trayBalloon(UINT uid, const wchar_t* title, const wchar_t* body) {
     NOTIFYICONDATAW nid{};
@@ -534,30 +599,140 @@ static HWND hwndFromUid(UINT uid) {
     return it == g_uidToHwnd.end() ? nullptr : it->second;
 }
 
+// ---- forward decls for menu actions ----
+static void actionMasterReset();
+static void actionCloseAll();
+static void actionExportJson();
+static void actionOpenConsole();
+static void actionOpenSettings();
+
 static void showContextMenuFor(UINT uid) {
-    HWND target = hwndFromUid(uid);
-    if (!target) return;
+    POINT pt; GetCursorPos(&pt);
+    SetForegroundWindow(g_msgWnd);
+
     HMENU m = CreatePopupMenu();
+    if (uid == MASTER_TRAY_UID) {
+        // ----- master star icon menu -----
+        AppendMenuW(m, MF_STRING, 1000, L"Master reset");
+        AppendMenuW(m, MF_STRING, 1001, L"Close all windows");
+        AppendMenuW(m, MF_STRING, 1002, L"Export to JSON…");
+        AppendMenuW(m, MF_STRING, 1003, L"Open console (log)");
+        AppendMenuW(m, MF_STRING, 1004, L"Settings…");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, 1099, L"Quit Laurence Trayhost");
+
+        int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_msgWnd, nullptr);
+        DestroyMenu(m);
+        PostMessageW(g_msgWnd, WM_NULL, 0, 0);
+
+        switch (cmd) {
+            case 1000: actionMasterReset();   break;
+            case 1001: actionCloseAll();      break;
+            case 1002: actionExportJson();    break;
+            case 1003: actionOpenConsole();   break;
+            case 1004: actionOpenSettings();  break;
+            case 1099: PostMessageW(g_msgWnd, WM_CLOSE, 0, 0); break;
+        }
+        return;
+    }
+
+    // ----- per-window icon menu -----
+    HWND target = hwndFromUid(uid);
+    if (!target) { DestroyMenu(m); return; }
     AppendMenuW(m, MF_STRING, 100, L"Focus");
+    AppendMenuW(m, MF_STRING, 102, IsIconic(target) ? L"Restore" : L"Minimise");
     AppendMenuW(m, MF_STRING, 101, L"Close window");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 200, L"Open settings (browser)");
-    AppendMenuW(m, MF_STRING, 999, L"Quit TraySys");
+    AppendMenuW(m, MF_STRING, 999, L"Quit Laurence Trayhost");
 
-    POINT pt; GetCursorPos(&pt);
-    SetForegroundWindow(g_msgWnd);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_msgWnd, nullptr);
     DestroyMenu(m);
-    PostMessageW(g_msgWnd, WM_NULL, 0, 0); // flush per MSDN
+    PostMessageW(g_msgWnd, WM_NULL, 0, 0);
 
     if (cmd == 100) focusHwnd(target);
     else if (cmd == 101) PostMessageW(target, WM_CLOSE, 0, 0);
-    else if (cmd == 200) {
-        wchar_t url[64];
-        swprintf(url, 64, L"http://127.0.0.1:%d/", HTTP_PORT);
-        ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+    else if (cmd == 102) {
+        if (IsIconic(target)) { ShowWindow(target, SW_RESTORE); focusHwnd(target); }
+        else                  { ShowWindow(target, SW_MINIMIZE); }
     }
+    else if (cmd == 200) actionOpenSettings();
     else if (cmd == 999) PostMessageW(g_msgWnd, WM_CLOSE, 0, 0);
+}
+
+// ---------- master-menu actions ----------
+static std::string buildStateJson();   // forward decl
+
+static void actionMasterReset() {
+    // Tear down all per-window tray icons + their hidden-from-taskbar state,
+    // then re-enumerate from scratch. Master star icon is left untouched.
+    {
+        std::lock_guard<std::mutex> lk(g_windowsMx);
+        for (auto& kv : g_windows) {
+            if (kv.second.hiddenFromTaskbar)
+                taskbarListSetVisibleDirect(kv.second.hwnd, true);
+            trayDelete(kv.second);
+            if (kv.second.rawIcon)    DestroyIcon(kv.second.rawIcon);
+            if (kv.second.badgedIcon) DestroyIcon(kv.second.badgedIcon);
+        }
+        g_windows.clear();
+        g_uidToHwnd.clear();
+    }
+    refreshWindows();
+    trayBalloon(MASTER_TRAY_UID, L"Master reset",
+                L"All tray icons cleared and re-enumerated.");
+}
+
+static void actionCloseAll() {
+    if (MessageBoxW(nullptr,
+        L"Send WM_CLOSE to every tracked window?\n\nUnsaved work in any of them may be lost.",
+        L"Laurence Trayhost — close all",
+        MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND) != IDYES) return;
+    std::vector<HWND> targets;
+    {
+        std::lock_guard<std::mutex> lk(g_windowsMx);
+        for (auto& kv : g_windows) targets.push_back(kv.second.hwnd);
+    }
+    for (HWND h : targets) PostMessageW(h, WM_CLOSE, 0, 0);
+    trayBalloon(MASTER_TRAY_UID, L"Close all",
+                L"Sent WM_CLOSE to all tracked windows.");
+}
+
+static void actionExportJson() {
+    // Write a snapshot of the current state to %USERPROFILE%\Desktop\trayhost-export-<ts>.json
+    char ts[32]; SYSTEMTIME st; GetLocalTime(&st);
+    snprintf(ts, sizeof(ts), "%04d%02d%02d-%02d%02d%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    char desktop[MAX_PATH] = {};
+    char* up = nullptr; size_t sz = 0;
+    _dupenv_s(&up, &sz, "USERPROFILE");
+    if (up) { snprintf(desktop, sizeof(desktop), "%s\\Desktop\\trayhost-export-%s.json", up, ts); free(up); }
+    else    { snprintf(desktop, sizeof(desktop), "trayhost-export-%s.json", ts); }
+    std::string body = buildStateJson();
+    FILE* f = fopen(desktop, "wb");
+    if (!f) {
+        trayBalloon(MASTER_TRAY_UID, L"Export failed", L"Couldn't write to Desktop.");
+        return;
+    }
+    fwrite(body.data(), 1, body.size(), f);
+    fclose(f);
+    wchar_t wpath[MAX_PATH]; MultiByteToWideChar(CP_UTF8, 0, desktop, -1, wpath, MAX_PATH);
+    wchar_t msg[MAX_PATH + 64];
+    swprintf(msg, MAX_PATH + 64, L"Saved snapshot to %ls", wpath);
+    trayBalloon(MASTER_TRAY_UID, L"Exported state", msg);
+}
+
+static void actionOpenConsole() {
+    // Open the live log in the default text viewer (typically Notepad).
+    wchar_t wlog[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, g_logPath, -1, wlog, MAX_PATH);
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", wlog, nullptr, SW_SHOWNORMAL);
+}
+
+static void actionOpenSettings() {
+    wchar_t url[64];
+    swprintf(url, 64, L"http://127.0.0.1:%d/", HTTP_PORT);
+    ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 // ---------- HTTP server (tiny, single-threaded accept-loop, blocking) ----------
@@ -738,6 +913,17 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         //   lParam = MAKELPARAM(message, uID)
         UINT evt = LOWORD(l);
         UINT uid = HIWORD(l);
+
+        // ----- master star icon -----
+        if (uid == MASTER_TRAY_UID) {
+            if (evt == WM_LBUTTONUP)            actionOpenSettings();
+            else if (evt == WM_LBUTTONDBLCLK)   actionOpenSettings();
+            else if (evt == WM_RBUTTONUP || evt == WM_CONTEXTMENU)
+                showContextMenuFor(MASTER_TRAY_UID);
+            return 0;
+        }
+
+        // ----- per-window icons -----
         HWND t = hwndFromUid(uid);
         if (!t) return 0;
 
@@ -765,14 +951,18 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TBL_SETVISIBLE:           // (HWND, bool) - only main thread touches g_taskbarList
         taskbarListSetVisibleDirect((HWND)w, l != 0);
         return 0;
+    case WM_APP + 4:                  // animation tick — advance master star frame
+        masterTrayAnimate();
+        return 0;
     case WM_DESTROY:
         g_quit.store(true);
+        masterTrayUnregister();
         // remove all our tray icons + restore any taskbar slots we hid
         {
             std::lock_guard<std::mutex> lk(g_windowsMx);
             for (auto& kv : g_windows) {
                 if (kv.second.hiddenFromTaskbar)
-                    taskbarListSetVisible(kv.second.hwnd, true);
+                    taskbarListSetVisibleDirect(kv.second.hwnd, true);
                 trayDelete(kv.second);
                 if (kv.second.rawIcon)    DestroyIcon(kv.second.rawIcon);
                 if (kv.second.badgedIcon) DestroyIcon(kv.second.badgedIcon);
@@ -821,6 +1011,12 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     if (!g_msgWnd) { logf("CreateWindow failed err=%lu", GetLastError()); return 1; }
     logf("msgwnd=%p created", g_msgWnd);
 
+    // Load animated star frames + register the master tray icon BEFORE the
+    // first refresh so the right-click menu is available immediately.
+    loadStarFrames();
+    masterTrayRegister();
+    logf("master tray registered (uid=%u)", (unsigned)MASTER_TRAY_UID);
+
     logf("calling initial refreshWindows...");
     refreshWindows();
     logf("initial refreshWindows done, icons=%zu", g_windows.size());
@@ -849,6 +1045,17 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         }
     });
     logf("refresh thread spawned");
+
+    // Animation thread — cycles the master star icon through colour frames.
+    std::thread starAnimThread([]{
+        while (!g_quit.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(STAR_ANIM_INTERVAL_MS));
+            if (g_quit.load()) break;
+            // Drive the animation from the main thread to avoid Shell_NotifyIcon
+            // races; PostMessage is cheap.
+            PostMessageW(g_msgWnd, WM_APP + 4, 0, 0);
+        }
+    });
 
     // Heartbeat — proves the main thread is pumping messages.
     std::thread heartbeatThread([]{
@@ -881,6 +1088,7 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     if (httpThread.joinable())      httpThread.join();
     if (refreshThread.joinable())   refreshThread.join();
     if (heartbeatThread.joinable()) heartbeatThread.join();
+    if (starAnimThread.joinable())  starAnimThread.join();
 
     if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
     logf("--- TraySys end ---");

@@ -1,0 +1,12 @@
+// Win32 resource script for Laurence Trayhost.
+// Bundles the 8 animation frames as ICON resources, IDs 100..107.
+// The first ICON entry (lowest ID) is also Windows' default app icon.
+
+100 ICON "../resources/star_00.ico"
+101 ICON "../resources/star_01.ico"
+102 ICON "../resources/star_02.ico"
+103 ICON "../resources/star_03.ico"
+104 ICON "../resources/star_04.ico"
+105 ICON "../resources/star_05.ico"
+106 ICON "../resources/star_06.ico"
+107 ICON "../resources/star_07.ico"

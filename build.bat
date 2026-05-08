@@ -27,10 +27,17 @@ if not exist "%OUT%" mkdir "%OUT%"
 REM ----- kill any running instance BEFORE compiling so link.exe can overwrite -----
 powershell -NoProfile -Command "Get-Process -Name 'LaurenceTrayhost*','TraySys*' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1200"
 
+REM ----- compile resources (icons) -----
+rc.exe /nologo /fo "%OUT%\app.res" src\app.rc
+if errorlevel 1 (
+    echo RC FAILED.
+    exit /b 1
+)
+
 REM ----- compile -----
 cl.exe /nologo /std:c++17 /O2 /EHsc /W3 /MT ^
     /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-    src\main.cpp ^
+    src\main.cpp "%OUT%\app.res" ^
     /Fo"%OUT%\\" /Fe"%EXE%" ^
     /link /SUBSYSTEM:WINDOWS ^
     user32.lib gdi32.lib shell32.lib shlwapi.lib ^
