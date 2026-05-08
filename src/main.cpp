@@ -39,8 +39,10 @@
 #include <algorithm>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.3.1"
-#define TRAYSYS_VERSION_A      "0.3.1"
+#define TRAYSYS_VERSION       L"0.3.3"
+#define TRAYSYS_VERSION_A      "0.3.3"
+#define REMINDER_INTERVAL_HOURS 168                 // weekly nudge
+#define PROFILE_SLOTS          5
 #define TRAY_CALLBACK_MSG     (WM_APP + 1)
 #define HTTP_PORT             8731
 #define REFRESH_INTERVAL_MS   1000
@@ -50,10 +52,11 @@
 #define STAR_FRAME_BASE_RES   100                // resource IDs 100..107
 #define STAR_ANIM_INTERVAL_MS 140                // ~7 fps colour cycle
 
-// ---------- log + bench ----------
+// ---------- log + bench + ini ----------
 // Paths resolved at startup to be next to the .exe so we never lose them to a weird CWD.
 static char g_logPath[MAX_PATH]   = "traysys.log";
 static char g_benchPath[MAX_PATH] = "traysys.bench.csv";
+static char g_iniPath[MAX_PATH]   = "traysys.ini";
 
 static void resolveDataPaths() {
     char exe[MAX_PATH] = {};
@@ -63,7 +66,55 @@ static void resolveDataPaths() {
         *slash = 0;
         snprintf(g_logPath,   MAX_PATH, "%s\\LaurenceTrayhost_v%s.log",       exe, TRAYSYS_VERSION_A);
         snprintf(g_benchPath, MAX_PATH, "%s\\LaurenceTrayhost_v%s.bench.csv", exe, TRAYSYS_VERSION_A);
+        snprintf(g_iniPath,   MAX_PATH, "%s\\LaurenceTrayhost_v%s.ini",       exe, TRAYSYS_VERSION_A);
     }
+}
+
+// ---------- INI live config ----------
+static int  iniGetInt(const char* section, const char* key, int def) {
+    return GetPrivateProfileIntA(section, key, def, g_iniPath);
+}
+static bool iniGetBool(const char* section, const char* key, bool def) {
+    return iniGetInt(section, key, def ? 1 : 0) != 0;
+}
+static void iniSetBool(const char* section, const char* key, bool val) {
+    WritePrivateProfileStringA(section, key, val ? "1" : "0", g_iniPath);
+}
+static long long iniGetLL(const char* section, const char* key, long long def) {
+    char buf[64]; char defStr[64];
+    snprintf(defStr, sizeof(defStr), "%lld", def);
+    GetPrivateProfileStringA(section, key, defStr, buf, sizeof(buf), g_iniPath);
+    return _atoi64(buf);
+}
+static void iniSetLL(const char* section, const char* key, long long val) {
+    char buf[64]; snprintf(buf, sizeof(buf), "%lld", val);
+    WritePrivateProfileStringA(section, key, buf, g_iniPath);
+}
+
+// ---------- autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ----------
+static const wchar_t* AUTOSTART_KEY  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* AUTOSTART_NAME = L"LaurenceTrayhost";
+
+static bool autostartIsEnabled() {
+    HKEY h{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_KEY, 0, KEY_READ, &h) != ERROR_SUCCESS) return false;
+    bool found = (RegQueryValueExW(h, AUTOSTART_NAME, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+    RegCloseKey(h);
+    return found;
+}
+
+static void autostartSet(bool on) {
+    HKEY h{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, AUTOSTART_KEY, 0, KEY_WRITE, &h) != ERROR_SUCCESS) return;
+    if (on) {
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring quoted = L"\"" + std::wstring(exe) + L"\"";
+        RegSetValueExW(h, AUTOSTART_NAME, 0, REG_SZ,
+            (const BYTE*)quoted.c_str(), (DWORD)((quoted.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(h, AUTOSTART_NAME);
+    }
+    RegCloseKey(h);
 }
 
 static std::mutex g_logMx;
@@ -146,6 +197,11 @@ static std::atomic<double>     g_lastRefreshDuration{0.0};
 // runtime flags (settable via /api/config in a future patch)
 static std::atomic<bool>       g_hideBrowsersFromTaskbar{true};
 static std::atomic<bool>       g_hideAllFromTaskbar{true};      // default: full takeover
+
+// TaskbarCreated registered message — explorer.exe broadcasts this when the
+// shell starts/restarts. We re-register every tray icon when it arrives,
+// which is THE fix for the "icons go blank until you hover" Windows quirk.
+static UINT                    g_taskbarCreatedMsg = 0;
 
 // COM ITaskbarList for AddTab/DeleteTab — hide browser windows from the real taskbar.
 // MUST only be touched from the main message thread (the COM apartment that created it).
@@ -305,6 +361,55 @@ static HICON makeBadgedIcon(HICON src, int number, COLORREF badgeColor) {
     return out;
 }
 
+// Convert any HICON into a desaturated, dimmed version — used for static
+// pinned-launcher icons so they read as "shortcuts" rather than active windows.
+static HICON makeDimIcon(HICON src) {
+    if (!src) return nullptr;
+    const int sz = 32;
+    HDC screen = GetDC(nullptr);
+    HDC mem    = CreateCompatibleDC(screen);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = sz;
+    bmi.bmiHeader.biHeight      = -sz;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP mask  = CreateBitmap(sz, sz, 1, 1, nullptr);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, color);
+
+    DrawIconEx(mem, 0, 0, src, sz, sz, 0, nullptr, DI_NORMAL);
+
+    // Desaturate + dim: every pixel -> luminance-blend(60% gray, 40% colour),
+    // then alpha multiplied by 0.55.
+    auto* px = static_cast<unsigned char*>(bits);
+    for (int i = 0; i < sz * sz; ++i) {
+        unsigned char b = px[i*4 + 0];
+        unsigned char g = px[i*4 + 1];
+        unsigned char r = px[i*4 + 2];
+        unsigned char a = px[i*4 + 3];
+        // Y' = 0.299R + 0.587G + 0.114B  (Rec.601 luma)
+        unsigned char y = (unsigned char)((r * 77 + g * 150 + b * 29) >> 8);
+        px[i*4 + 0] = (unsigned char)((b + y * 3) >> 2);   // 25% colour, 75% gray
+        px[i*4 + 1] = (unsigned char)((g + y * 3) >> 2);
+        px[i*4 + 2] = (unsigned char)((r + y * 3) >> 2);
+        px[i*4 + 3] = (unsigned char)((a * 140) >> 8);     // ~55% opacity
+    }
+
+    SelectObject(mem, oldBmp);
+
+    ICONINFO ii{}; ii.fIcon = TRUE; ii.hbmColor = color; ii.hbmMask = mask;
+    HICON out = CreateIconIndirect(&ii);
+
+    DeleteObject(color); DeleteObject(mask);
+    DeleteDC(mem); ReleaseDC(nullptr, screen);
+    return out;
+}
+
 // Classify exe name: returns badge color for distinguishing categories.
 //   browsers -> amber/orange (so duplicates of Chrome look like browser-tabs)
 //   default  -> blue
@@ -396,6 +501,8 @@ struct PinnedApp {
     std::wstring  lnkPath;
     std::wstring  displayName;   // shortcut filename minus .lnk
     std::wstring  targetExe;
+    bool          launchAtBoot = false;
+    std::string   iniKey;        // ASCII-safe key for [boot_apps]
 };
 static std::vector<PinnedApp> g_pinned;
 static std::mutex             g_pinnedMx;
@@ -486,7 +593,9 @@ static void loadPinnedApps() {
         p.displayName  = fd.cFileName;
         size_t dot = p.displayName.rfind(L".lnk");
         if (dot != std::wstring::npos) p.displayName.resize(dot);
-        p.icon = extractIconFromExe(target);
+        HICON raw = extractIconFromExe(target);
+        p.icon = makeDimIcon(raw);
+        if (raw) DestroyIcon(raw);
 
         if (pinnedTrayAdd(p)) {
             std::lock_guard<std::mutex> lk(g_pinnedMx);
@@ -749,13 +858,145 @@ static void actionExportJson();
 static void actionOpenConsole();
 static void actionOpenSettings();
 
+// ---------- profiles (5 named slots, persisted in INI) ----------
+// A profile snapshots the set of currently-running tracked apps (by exe).
+// Apply = launch any matching pinned-app .lnk that isn't already running.
+// Stored in [profile_N] sections: name=..., apps=chrome.exe,slack.exe,...
+
+struct Profile {
+    int          slot;
+    std::string  name;
+    std::string  apps;   // comma-separated exe basenames (ascii-lowered)
+};
+
+static std::string defaultProfileName(int slot) {
+    char b[32]; snprintf(b, sizeof(b), "Profile %d", slot); return b;
+}
+
+static Profile profileLoad(int slot) {
+    Profile p; p.slot = slot;
+    char section[24]; snprintf(section, sizeof(section), "profile_%d", slot);
+    char buf[1024];
+    GetPrivateProfileStringA(section, "name",
+        defaultProfileName(slot).c_str(), buf, sizeof(buf), g_iniPath);
+    p.name = buf;
+    GetPrivateProfileStringA(section, "apps", "", buf, sizeof(buf), g_iniPath);
+    p.apps = buf;
+    return p;
+}
+
+static void profileSave(const Profile& p) {
+    char section[24]; snprintf(section, sizeof(section), "profile_%d", p.slot);
+    WritePrivateProfileStringA(section, "name", p.name.c_str(), g_iniPath);
+    WritePrivateProfileStringA(section, "apps", p.apps.c_str(), g_iniPath);
+}
+
+static std::string captureRunningExes() {
+    std::string out;
+    std::lock_guard<std::mutex> lk(g_windowsMx);
+    std::unordered_set<std::string> seen;
+    for (auto& kv : g_windows) {
+        std::string s; s.reserve(kv.second.exeNameLower.size());
+        for (wchar_t c : kv.second.exeNameLower) s.push_back((char)(c & 0x7F));
+        if (seen.insert(s).second) {
+            if (!out.empty()) out += ",";
+            out += s;
+        }
+    }
+    return out;
+}
+
+static void profileSnapshot(int slot) {
+    Profile p = profileLoad(slot);
+    p.apps = captureRunningExes();
+    profileSave(p);
+    wchar_t wname[256] = {};
+    MultiByteToWideChar(CP_UTF8, 0, p.name.c_str(), -1, wname, 256);
+    wchar_t body[400];
+    swprintf(body, 400, L"Snapshotted to \"%ls\". Right-click star → Profiles → Apply to restore.", wname);
+    trayBalloon(MASTER_TRAY_UID, L"Profile saved", body);
+}
+
+static void profileApply(int slot) {
+    Profile p = profileLoad(slot);
+    if (p.apps.empty()) {
+        trayBalloon(MASTER_TRAY_UID, L"Profile empty", L"Nothing to launch — snapshot one first.");
+        return;
+    }
+    int launched = 0;
+    std::string token;
+    auto tryLaunch = [&](const std::string& exe) {
+        std::lock_guard<std::mutex> lk(g_pinnedMx);
+        for (auto& pa : g_pinned) {
+            std::wstring tw = pa.targetExe;
+            size_t bs = tw.find_last_of(L"\\/");
+            std::wstring base = (bs == std::wstring::npos) ? tw : tw.substr(bs + 1);
+            std::transform(base.begin(), base.end(), base.begin(), ::towlower);
+            std::string baseAscii; baseAscii.reserve(base.size());
+            for (wchar_t c : base) baseAscii.push_back((char)(c & 0x7F));
+            if (baseAscii == exe) {
+                ShellExecuteW(nullptr, L"open", pa.lnkPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                ++launched;
+                return;
+            }
+        }
+    };
+    for (size_t i = 0; i <= p.apps.size(); ++i) {
+        if (i == p.apps.size() || p.apps[i] == ',') {
+            if (!token.empty()) tryLaunch(token);
+            token.clear();
+        } else token.push_back(p.apps[i]);
+    }
+    wchar_t body[200];
+    swprintf(body, 200, L"Launched %d of %zu apps.", launched,
+             std::count(p.apps.begin(), p.apps.end(), ',') + (p.apps.empty() ? 0 : 1));
+    trayBalloon(MASTER_TRAY_UID, L"Profile applied", body);
+}
+
+static void profileRename(int slot) {
+    wchar_t url[80];
+    swprintf(url, 80, L"http://127.0.0.1:%d/#profile-%d", HTTP_PORT, slot);
+    ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 static void showContextMenuFor(UINT uid) {
     POINT pt; GetCursorPos(&pt);
     SetForegroundWindow(g_msgWnd);
 
     HMENU m = CreatePopupMenu();
     if (uid == MASTER_TRAY_UID) {
+        // ----- profiles submenu -----
+        HMENU snapMenu  = CreatePopupMenu();
+        HMENU applyMenu = CreatePopupMenu();
+        HMENU nameMenu  = CreatePopupMenu();
+        for (int i = 1; i <= PROFILE_SLOTS; ++i) {
+            Profile p = profileLoad(i);
+            wchar_t label[256]; size_t apps = 0;
+            for (char c : p.apps) if (c == ',') ++apps;
+            if (!p.apps.empty()) ++apps;
+            int n = MultiByteToWideChar(CP_UTF8, 0, p.name.c_str(), -1, label, 256);
+            (void)n;
+            // Snapshot label: "Slot N — current name"
+            wchar_t snapLbl[300]; swprintf(snapLbl, 300, L"Slot %d — %ls", i, label);
+            AppendMenuW(snapMenu,  MF_STRING, 1100 + i, snapLbl);
+            // Apply label: "Profile name (X apps)"
+            wchar_t appLbl[300]; swprintf(appLbl, 300, L"%ls  (%zu apps)", label, apps);
+            AppendMenuW(applyMenu, apps == 0 ? (MF_STRING | MF_GRAYED) : MF_STRING,
+                        1200 + i, appLbl);
+            wchar_t renLbl[300]; swprintf(renLbl, 300, L"Rename slot %d (%ls)…", i, label);
+            AppendMenuW(nameMenu,  MF_STRING, 1300 + i, renLbl);
+        }
+        HMENU profMenu = CreatePopupMenu();
+        AppendMenuW(profMenu, MF_POPUP, (UINT_PTR)snapMenu,  L"Snapshot current →");
+        AppendMenuW(profMenu, MF_POPUP, (UINT_PTR)applyMenu, L"Apply profile →");
+        AppendMenuW(profMenu, MF_POPUP, (UINT_PTR)nameMenu,  L"Rename →");
+
         // ----- master star icon menu -----
+        bool autostart = autostartIsEnabled();
+        AppendMenuW(m, MF_STRING | (autostart ? MF_CHECKED : MF_UNCHECKED),
+                    1010, L"Auto-start with Windows");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)profMenu, L"Profiles");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, 1000, L"Master reset");
         AppendMenuW(m, MF_STRING, 1001, L"Close all windows");
         AppendMenuW(m, MF_STRING, 1002, L"Export to JSON…");
@@ -768,7 +1009,17 @@ static void showContextMenuFor(UINT uid) {
         DestroyMenu(m);
         PostMessageW(g_msgWnd, WM_NULL, 0, 0);
 
-        switch (cmd) {
+        if (cmd == 1010) {
+            autostartSet(!autostart);
+            trayBalloon(MASTER_TRAY_UID,
+                !autostart ? L"Auto-start enabled" : L"Auto-start disabled",
+                !autostart ? L"Laurence Trayhost will launch with Windows."
+                           : L"Laurence Trayhost will not launch with Windows.");
+        }
+        else if (cmd >= 1100 && cmd < 1100 + PROFILE_SLOTS + 1) profileSnapshot(cmd - 1100);
+        else if (cmd >= 1200 && cmd < 1200 + PROFILE_SLOTS + 1) profileApply(cmd - 1200);
+        else if (cmd >= 1300 && cmd < 1300 + PROFILE_SLOTS + 1) profileRename(cmd - 1300);
+        else switch (cmd) {
             case 1000: actionMasterReset();   break;
             case 1001: actionCloseAll();      break;
             case 1002: actionExportJson();    break;
@@ -906,8 +1157,16 @@ button:hover{background:#222}
 <div class="stats" id="stats"></div>
 <div>
   <button onclick="r()">Refresh now</button>
-  <button onclick="q()">Quit TraySys</button>
+  <button onclick="q()">Quit Laurence Trayhost</button>
+  <label style="margin-left:18px;color:#bbb">
+    <input type="checkbox" id="autostart" onchange="toggleAutostart(this)"> Auto-start with Windows
+  </label>
 </div>
+
+<h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Profiles</h2>
+<div id="profiles"></div>
+
+<h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Active windows</h2>
 <table id="t"><thead><tr><th class="uid">UID</th><th>Exe</th><th>Title</th></tr></thead><tbody></tbody></table>
 <script>
 async function load(){
@@ -918,12 +1177,51 @@ async function load(){
     <div class="stat"><div class="k">Last refresh</div><div class="v">${r.refresh_ms.toFixed(1)} ms</div></div>
     <div class="stat"><div class="k">RSS</div><div class="v">${(r.rss_kb/1024).toFixed(1)} MB</div></div>
     <div class="stat"><div class="k">Uptime</div><div class="v">${(r.uptime_s).toFixed(0)} s</div></div>`;
-  const tb = document.querySelector('#t tbody');
-  tb.innerHTML = r.windows.map(w=>`<tr><td class="uid">${w.uid}</td><td class="exe">${w.exe}</td><td class="title">${w.title}</td></tr>`).join('');
+  document.querySelector('#t tbody').innerHTML =
+    r.windows.map(w=>`<tr><td class="uid">${w.uid}</td><td class="exe">${w.exe}</td><td class="title">${w.title}</td></tr>`).join('');
+}
+async function loadAutostart(){
+  const r = await fetch('/api/autostart').then(x=>x.json());
+  document.getElementById('autostart').checked = !!r.enabled;
+}
+async function toggleAutostart(cb){
+  await fetch('/api/autostart',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enabled='+(cb.checked?1:0)});
+}
+async function loadProfiles(){
+  const r = await fetch('/api/profiles').then(x=>x.json());
+  const wrap = document.getElementById('profiles');
+  wrap.innerHTML = r.profiles.map(p=>`
+    <div id="profile-${p.slot}" style="background:#0f0f0f;border:1px solid #222;border-radius:6px;padding:10px 12px;margin:8px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div style="color:#666;font-variant-numeric:tabular-nums;width:28px">#${p.slot}</div>
+      <input type="text" value="${p.name.replace(/"/g,'&quot;')}" data-slot="${p.slot}"
+             onblur="renameProfile(this)" onkeydown="if(event.key==='Enter')this.blur()"
+             style="background:#1a1a1a;color:#e6e6e6;border:1px solid #2a2a2a;padding:6px 10px;border-radius:4px;flex:1;min-width:160px"/>
+      <div style="color:#888;font-size:12px;flex:2;min-width:240px">${p.apps || '<em style=color:#444>empty</em>'}</div>
+      <button onclick="snapProfile(${p.slot})">Snapshot</button>
+      <button onclick="applyProfile(${p.slot})" ${p.apps?'':'disabled style=opacity:.4;cursor:default'}>Apply</button>
+    </div>`).join('');
+}
+async function snapProfile(slot){
+  await fetch('/api/profile/'+slot+'/snapshot',{method:'POST'});
+  loadProfiles();
+}
+async function applyProfile(slot){
+  await fetch('/api/profile/'+slot+'/apply',{method:'POST'});
+}
+async function renameProfile(input){
+  const slot = input.dataset.slot;
+  const name = encodeURIComponent(input.value);
+  await fetch('/api/profile/'+slot+'/rename',{
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'name='+name
+  });
+  loadProfiles();
 }
 async function r(){ await fetch('/api/refresh',{method:'POST'}); load(); }
-async function q(){ if(confirm('Quit TraySys and remove all tray icons?')) await fetch('/api/quit',{method:'POST'}); }
-load(); setInterval(load, 1500);
+async function q(){ if(confirm('Quit Laurence Trayhost and remove all tray icons?')) await fetch('/api/quit',{method:'POST'}); }
+load(); loadAutostart(); loadProfiles();
+setInterval(load, 1500);
 </script>
 )HTML";
 
@@ -1006,12 +1304,71 @@ static void httpHandle(SOCKET s) {
     } else if (strcmp(path, "/api/state") == 0) {
         httpRespond(s, "200 OK", "application/json", buildStateJson());
     } else if (strcmp(path, "/api/refresh") == 0 && strcmp(method, "POST") == 0) {
-        // post a custom message; the main thread does the work
         PostMessageW(g_msgWnd, WM_APP + 2, 0, 0);
         httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
     } else if (strcmp(path, "/api/quit") == 0 && strcmp(method, "POST") == 0) {
         httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
         PostMessageW(g_msgWnd, WM_CLOSE, 0, 0);
+    } else if (strcmp(path, "/api/profiles") == 0 && strcmp(method, "GET") == 0) {
+        // dump all 5 profile slots as JSON
+        std::string j = "{\"profiles\":[";
+        for (int i = 1; i <= PROFILE_SLOTS; ++i) {
+            if (i > 1) j += ",";
+            Profile p = profileLoad(i);
+            char b[1024];
+            snprintf(b, sizeof(b),
+                "{\"slot\":%d,\"name\":\"%s\",\"apps\":\"%s\"}",
+                p.slot,
+                jsonEscape(p.name).c_str(),
+                jsonEscape(p.apps).c_str());
+            j += b;
+        }
+        j += "]}";
+        httpRespond(s, "200 OK", "application/json", j);
+    } else if (strcmp(method, "POST") == 0 && strncmp(path, "/api/profile/", 13) == 0) {
+        // /api/profile/<slot>/<rename|snapshot|apply>?body for rename
+        int slot = 0; char op[24] = {};
+        sscanf_s(path + 13, "%d/%23s", &slot, op, (unsigned)sizeof(op));
+        if (slot < 1 || slot > PROFILE_SLOTS) {
+            httpRespond(s, "400 Bad Request", "text/plain", std::string("bad slot"));
+        } else {
+            if (strcmp(op, "snapshot") == 0)      profileSnapshot(slot);
+            else if (strcmp(op, "apply") == 0)    profileApply(slot);
+            else if (strcmp(op, "rename") == 0) {
+                // Body: name=...   (form-encoded)
+                const char* body = strstr(buf, "\r\n\r\n");
+                if (body) {
+                    body += 4;
+                    const char* p = strstr(body, "name=");
+                    if (p) {
+                        Profile pf = profileLoad(slot);
+                        pf.name = p + 5;
+                        // simple URL-decode: replace + with space, %xx with byte
+                        std::string clean;
+                        for (size_t i = 0; i < pf.name.size(); ++i) {
+                            char c = pf.name[i];
+                            if (c == '+') clean += ' ';
+                            else if (c == '%' && i + 2 < pf.name.size()) {
+                                char hex[3] = { pf.name[i+1], pf.name[i+2], 0 };
+                                clean += (char)strtol(hex, nullptr, 16);
+                                i += 2;
+                            } else clean += c;
+                        }
+                        pf.name = clean.substr(0, clean.find('&'));
+                        profileSave(pf);
+                    }
+                }
+            }
+            httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
+        }
+    } else if (strcmp(path, "/api/autostart") == 0 && strcmp(method, "GET") == 0) {
+        std::string j = std::string("{\"enabled\":") + (autostartIsEnabled() ? "true" : "false") + "}";
+        httpRespond(s, "200 OK", "application/json", j);
+    } else if (strcmp(path, "/api/autostart") == 0 && strcmp(method, "POST") == 0) {
+        const char* body = strstr(buf, "\r\n\r\n");
+        bool on = body && strstr(body, "enabled=1");
+        autostartSet(on);
+        httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
     } else {
         httpRespond(s, "404 Not Found", "text/plain", std::string("not found"));
     }
@@ -1046,8 +1403,27 @@ static void httpServerThread() {
     WSACleanup();
 }
 
+// ---------- re-register every tray icon (used after TaskbarCreated) ----------
+static void reRegisterAllTrayIcons() {
+    logf("re-registering all tray icons (master + %zu pinned + %zu windows)",
+         g_pinned.size(), g_windows.size());
+    masterTrayRegister();
+    {
+        std::lock_guard<std::mutex> lk(g_pinnedMx);
+        for (auto& p : g_pinned) pinnedTrayAdd(p);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_windowsMx);
+        for (auto& kv : g_windows) trayAdd(kv.second);
+    }
+}
+
 // ---------- message-only window proc ----------
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (g_taskbarCreatedMsg && m == g_taskbarCreatedMsg) {
+        reRegisterAllTrayIcons();
+        return 0;
+    }
     switch (m) {
     // (WM_TIMER no longer used — refresh runs on a worker thread.)
     case TRAY_CALLBACK_MSG: {
@@ -1184,6 +1560,11 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
                                HWND_MESSAGE, nullptr, hi, nullptr);
     if (!g_msgWnd) { logf("CreateWindow failed err=%lu", GetLastError()); return 1; }
     logf("msgwnd=%p created", g_msgWnd);
+
+    // listen for explorer.exe restarts so we can re-register icons
+    g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    ChangeWindowMessageFilterEx(g_msgWnd, g_taskbarCreatedMsg, MSGFLT_ALLOW, nullptr);
+    logf("TaskbarCreated msg registered (id=%u)", g_taskbarCreatedMsg);
 
     // Load animated star frames + register the master tray icon BEFORE the
     // first refresh so the right-click menu is available immediately.
