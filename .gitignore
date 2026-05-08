@@ -1,0 +1,21 @@
+# build outputs
+build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# logs / runtime artefacts
+*.log
+*.bench.csv
+traydeck.log
+traysys.log
+
+# editor / OS junk
+.vs/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
