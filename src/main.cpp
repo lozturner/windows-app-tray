@@ -39,12 +39,13 @@
 #include <algorithm>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.3.0"
-#define TRAYSYS_VERSION_A      "0.3.0"
+#define TRAYSYS_VERSION       L"0.3.1"
+#define TRAYSYS_VERSION_A      "0.3.1"
 #define TRAY_CALLBACK_MSG     (WM_APP + 1)
 #define HTTP_PORT             8731
 #define REFRESH_INTERVAL_MS   1000
 #define MASTER_TRAY_UID       0x7000             // dedicated UID for the animated master icon
+#define PINNED_UID_BASE       0x6000             // 0x6000..0x6FFF reserved for pinned-app launcher icons
 #define STAR_FRAME_COUNT      8
 #define STAR_FRAME_BASE_RES   100                // resource IDs 100..107
 #define STAR_ANIM_INTERVAL_MS 140                // ~7 fps colour cycle
@@ -144,6 +145,7 @@ static std::atomic<double>     g_lastRefreshDuration{0.0};
 
 // runtime flags (settable via /api/config in a future patch)
 static std::atomic<bool>       g_hideBrowsersFromTaskbar{true};
+static std::atomic<bool>       g_hideAllFromTaskbar{true};      // default: full takeover
 
 // COM ITaskbarList for AddTab/DeleteTab — hide browser windows from the real taskbar.
 // MUST only be touched from the main message thread (the COM apartment that created it).
@@ -383,6 +385,144 @@ static void trayModify(ManagedWindow& m) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// ---------- pinned-app static launcher icons ----------
+// We scan the user's TaskBar pinned-shortcut folder, resolve each .lnk to its
+// target exe, extract the icon, and register a tray icon.  Click → ShellExecute
+// the .lnk so it launches with whatever args the original pin was set up with.
+
+struct PinnedApp {
+    UINT          uid;
+    HICON         icon;
+    std::wstring  lnkPath;
+    std::wstring  displayName;   // shortcut filename minus .lnk
+    std::wstring  targetExe;
+};
+static std::vector<PinnedApp> g_pinned;
+static std::mutex             g_pinnedMx;
+
+static std::wstring shellLinkResolve(const std::wstring& lnk) {
+    IShellLinkW*  sl = nullptr;
+    IPersistFile* pf = nullptr;
+    std::wstring out;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IShellLinkW, (void**)&sl);
+    if (FAILED(hr) || !sl) return out;
+    if (SUCCEEDED(sl->QueryInterface(IID_IPersistFile, (void**)&pf)) && pf) {
+        if (SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
+            wchar_t target[MAX_PATH] = {};
+            WIN32_FIND_DATAW fd{};
+            sl->Resolve(nullptr, SLR_NO_UI | SLR_NOSEARCH | SLR_NOTRACK | SLR_NOLINKINFO);
+            sl->GetPath(target, MAX_PATH, &fd, SLGP_RAWPATH);
+            out = target;
+        }
+        pf->Release();
+    }
+    sl->Release();
+    return out;
+}
+
+static HICON extractIconFromExe(const std::wstring& exePath) {
+    HICON ico = nullptr;
+    ExtractIconExW(exePath.c_str(), 0, nullptr, &ico, 1);
+    if (!ico) {
+        SHFILEINFOW sfi{};
+        SHGetFileInfoW(exePath.c_str(), 0, &sfi, sizeof(sfi),
+                       SHGFI_ICON | SHGFI_SMALLICON);
+        if (sfi.hIcon) ico = sfi.hIcon;
+    }
+    return ico;
+}
+
+static bool pinnedTrayAdd(PinnedApp& p) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize           = sizeof(nid);
+    nid.hWnd             = g_msgWnd;
+    nid.uID              = p.uid;
+    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    nid.uCallbackMessage = TRAY_CALLBACK_MSG;
+    nid.hIcon            = p.icon ? p.icon : LoadIcon(nullptr, IDI_APPLICATION);
+    std::wstring tip = L"[Pinned] " + p.displayName;
+    if (tip.size() > 127) tip.resize(127);
+    lstrcpynW(nid.szTip, tip.c_str(), 128);
+    if (Shell_NotifyIconW(NIM_ADD, &nid) != TRUE) return false;
+    nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    return true;
+}
+
+static void loadPinnedApps() {
+    char* appdata = nullptr; size_t sz = 0;
+    _dupenv_s(&appdata, &sz, "APPDATA");
+    if (!appdata) return;
+    std::wstring base;
+    {
+        wchar_t wbuf[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, appdata, -1, wbuf, MAX_PATH);
+        base = wbuf;
+    }
+    free(appdata);
+    base += L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\\*.lnk";
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(base.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        logf("loadPinnedApps: no pinned dir or empty");
+        return;
+    }
+    UINT nextUid = PINNED_UID_BASE;
+    int i = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        // strip filename out of base: replace last '\\*.lnk' segment
+        std::wstring dir = base.substr(0, base.find_last_of(L'\\') + 1);
+        std::wstring lnk = dir + fd.cFileName;
+        std::wstring target = shellLinkResolve(lnk);
+        if (target.empty()) continue;
+
+        PinnedApp p{};
+        p.uid          = nextUid++;
+        p.lnkPath      = lnk;
+        p.targetExe    = target;
+        p.displayName  = fd.cFileName;
+        size_t dot = p.displayName.rfind(L".lnk");
+        if (dot != std::wstring::npos) p.displayName.resize(dot);
+        p.icon = extractIconFromExe(target);
+
+        if (pinnedTrayAdd(p)) {
+            std::lock_guard<std::mutex> lk(g_pinnedMx);
+            g_pinned.push_back(std::move(p));
+            ++i;
+        } else if (p.icon) {
+            DestroyIcon(p.icon);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    logf("loadPinnedApps: registered %d pinned launchers", i);
+}
+
+static const PinnedApp* pinnedFromUid(UINT uid) {
+    std::lock_guard<std::mutex> lk(g_pinnedMx);
+    for (auto& p : g_pinned) if (p.uid == uid) return &p;
+    return nullptr;
+}
+
+static void pinnedLaunch(const PinnedApp& p) {
+    ShellExecuteW(nullptr, L"open", p.lnkPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void unregisterAllPinned() {
+    std::lock_guard<std::mutex> lk(g_pinnedMx);
+    for (auto& p : g_pinned) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd   = g_msgWnd;
+        nid.uID    = p.uid;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        if (p.icon) DestroyIcon(p.icon);
+    }
+    g_pinned.clear();
+}
+
 // ---------- master tray icon (the animated star) ----------
 static HICON g_starFrames[STAR_FRAME_COUNT] = {};
 static std::atomic<int> g_starFrameIdx{0};
@@ -522,8 +662,11 @@ static void refreshWindows() {
                 if (trayAdd(m)) {
                     g_uidToHwnd[m.uid] = h;
                     auto [ins, _] = g_windows.emplace(h, std::move(m));
-                    // hide browser window from real taskbar if configured
-                    if (g_hideBrowsersFromTaskbar.load() && isBrowserExe(ins->second.exeNameLower)) {
+                    // hide window from real taskbar per the global flags
+                    bool wantHide =
+                        g_hideAllFromTaskbar.load() ||
+                        (g_hideBrowsersFromTaskbar.load() && isBrowserExe(ins->second.exeNameLower));
+                    if (wantHide) {
                         taskbarListSetVisible(h, false);
                         ins->second.hiddenFromTaskbar = true;
                     }
@@ -923,21 +1066,51 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
 
+        // ----- pinned launcher icons (range PINNED_UID_BASE..) -----
+        if (uid >= PINNED_UID_BASE && uid < MASTER_TRAY_UID) {
+            const PinnedApp* p = pinnedFromUid(uid);
+            if (!p) return 0;
+            if (evt == WM_LBUTTONUP || evt == WM_LBUTTONDBLCLK) {
+                pinnedLaunch(*p);
+            } else if (evt == WM_RBUTTONUP || evt == WM_CONTEXTMENU) {
+                // simple menu: launch, open file location
+                POINT pt; GetCursorPos(&pt);
+                SetForegroundWindow(g_msgWnd);
+                HMENU m = CreatePopupMenu();
+                AppendMenuW(m, MF_STRING, 1, L"Launch");
+                AppendMenuW(m, MF_STRING, 2, L"Open file location");
+                int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_msgWnd, nullptr);
+                DestroyMenu(m);
+                PostMessageW(g_msgWnd, WM_NULL, 0, 0);
+                if (cmd == 1) pinnedLaunch(*p);
+                else if (cmd == 2) {
+                    std::wstring args = L"/select,\"" + p->lnkPath + L"\"";
+                    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+                }
+            }
+            return 0;
+        }
+
         // ----- per-window icons -----
         HWND t = hwndFromUid(uid);
         if (!t) return 0;
 
         if (evt == WM_LBUTTONUP) {
-            // single click — focus, restoring if minimised
-            focusHwnd(t);
-        } else if (evt == WM_LBUTTONDBLCLK) {
-            // double click — toggle visibility (minimise <-> restore+focus)
-            if (IsIconic(t)) {
-                ShowWindow(t, SW_RESTORE);
-                focusHwnd(t);
-            } else {
+            // Windows-taskbar-style toggle: clicking the foreground window's
+            // tray icon minimises it; clicking any other tray icon focuses
+            // (restoring if minimised). Eliminates the dblclk race where
+            // the trailing WM_LBUTTONUP after WM_LBUTTONDBLCLK un-minimised.
+            HWND fg = GetForegroundWindow();
+            if (t == fg && !IsIconic(t)) {
                 ShowWindow(t, SW_MINIMIZE);
+            } else {
+                if (IsIconic(t)) ShowWindow(t, SW_RESTORE);
+                focusHwnd(t);
             }
+        } else if (evt == WM_LBUTTONDBLCLK) {
+            // Double click — always force foreground, never minimise.
+            if (IsIconic(t)) ShowWindow(t, SW_RESTORE);
+            focusHwnd(t);
         } else if (evt == WM_MBUTTONUP) {
             PostMessageW(t, WM_CLOSE, 0, 0);
         } else if (evt == WM_RBUTTONUP || evt == WM_CONTEXTMENU) {
@@ -957,6 +1130,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         g_quit.store(true);
         masterTrayUnregister();
+        unregisterAllPinned();
         // remove all our tray icons + restore any taskbar slots we hid
         {
             std::lock_guard<std::mutex> lk(g_windowsMx);
@@ -1016,6 +1190,8 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     loadStarFrames();
     masterTrayRegister();
     logf("master tray registered (uid=%u)", (unsigned)MASTER_TRAY_UID);
+
+    loadPinnedApps();
 
     logf("calling initial refreshWindows...");
     refreshWindows();
