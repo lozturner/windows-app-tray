@@ -1730,6 +1730,7 @@ static void shellHookInstall() {
         logf("ShellHook registered (msg=%u)", g_shellHookMsg);
     } else {
         logf("RegisterShellHookWindow FAILED err=%lu", GetLastError());
+        g_shellHookMsg = 0;   // don't keep a stale atom that wndProc would match against
     }
 }
 static void shellHookUninstall() {
