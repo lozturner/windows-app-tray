@@ -40,8 +40,8 @@
 #include <random>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.3.6"
-#define TRAYSYS_VERSION_A      "0.3.6"
+#define TRAYSYS_VERSION       L"0.4.0"
+#define TRAYSYS_VERSION_A      "0.4.0"
 #define TIMER_DEBOUNCE_REFRESH 7
 #define REMINDER_INTERVAL_HOURS 168                 // weekly nudge
 #define PROFILE_SLOTS          5
@@ -112,11 +112,17 @@ static int  clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi 
 extern std::atomic<int> g_refreshIntervalMs;
 extern std::atomic<int> g_debounceMs;
 extern std::atomic<int> g_starAnimMs;
+extern std::atomic<int> g_engine;
 
 static void tuningLoad() {
     g_refreshIntervalMs.store(clampInt(iniGetInt("tuning", "refresh_interval_ms", 5000), 500, 60000));
     g_debounceMs.store       (clampInt(iniGetInt("tuning", "debounce_ms",          150),  20,  2000));
     g_starAnimMs.store       (clampInt(iniGetInt("tuning", "star_anim_ms",         140),   0,  5000));
+    g_engine.store           (clampInt(iniGetInt("engine", "mode",                  0),    0,     2));
+}
+static void engineSave() {
+    char b[8]; snprintf(b, 8, "%d", g_engine.load());
+    WritePrivateProfileStringA("engine", "mode", b, g_iniPath);
 }
 static void tuningSave() {
     char b[32];
@@ -237,6 +243,17 @@ static std::atomic<int>        g_starAnimMs{140};           // 0 = stop animatio
 // Per-window event hook (WinEvents) — replaces polling-as-primary with
 // "react when Windows tells us a window changed".
 static HWINEVENTHOOK           g_winEventHook = nullptr;
+
+// Shell hook message — explorer.exe pushes HSHELL_* notifications directly.
+// This is the cleanest push channel for window lifecycle.
+static UINT                    g_shellHookMsg = 0;
+
+// Engine selector — three independent strategies:
+//   PUSH   (default): RegisterShellHookWindow + WinEventHook, NO polling.
+//   HYBRID:           push events + the safety-net poll thread.
+//   POLL:              legacy — disable both push hooks, poll-only.
+enum class Engine : int { PUSH = 0, HYBRID = 1, POLL = 2 };
+static std::atomic<int>        g_engine{(int)Engine::PUSH};
 
 // COM ITaskbarList for AddTab/DeleteTab — hide browser windows from the real taskbar.
 // MUST only be touched from the main message thread (the COM apartment that created it).
@@ -1322,11 +1339,14 @@ button:hover{background:#222}
   </label>
 </div>
 
-<h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Timings (live — saved instantly)</h2>
-<p style="color:#888;font-size:12px;margin:0 0 14px;line-height:1.5">
-v0.3.5 reacts to Windows window-events in real time, so polling is just a safety-net.
-Lower the poll for snappier; raise it if you see flicker. Debounce coalesces bursts of events into a single refresh.
+<h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Engine</h2>
+<p style="color:#888;font-size:12px;margin:0 0 12px;line-height:1.5">
+How Trayhost learns about window changes.  Push uses two independent OS push channels (RegisterShellHookWindow + WinEventHook) and never polls. Hybrid adds a slow safety-net poll. Polling is the legacy fallback.
 </p>
+<div id="engine" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:24px"></div>
+
+<h2 style="margin-top:8px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Timings (live — saved instantly)</h2>
+<p id="tuning-blurb" style="color:#888;font-size:12px;margin:0 0 14px;line-height:1.5"></p>
 <div id="tuning" style="display:grid;grid-template-columns:200px 1fr 80px;gap:10px 16px;align-items:center;margin-bottom:24px"></div>
 
 <h2 style="margin-top:32px;font-size:14px;color:#888;text-transform:uppercase;letter-spacing:.7px">Profiles</h2>
@@ -1386,13 +1406,38 @@ async function renameProfile(input){
 }
 async function r(){ await fetch('/api/refresh',{method:'POST'}); load(); }
 async function q(){ if(confirm('Quit Laurence Trayhost and remove all tray icons?')) await fetch('/api/quit',{method:'POST'}); }
+async function loadEngine(){
+  const r = await fetch('/api/engine').then(x=>x.json());
+  const modes = [
+    {v:0, k:'PUSH',   d:'Pure push (recommended)'},
+    {v:1, k:'HYBRID', d:'Push + safety-net poll'},
+    {v:2, k:'POLL',   d:'Legacy polling only'},
+  ];
+  document.getElementById('engine').innerHTML = modes.map(m=>`
+    <button onclick="setEngine(${m.v})"
+            style="background:${m.v===r.mode?'#1f3a5f':'#1a1a1a'};color:#e6e6e6;border:1px solid ${m.v===r.mode?'#3b6ea3':'#2a2a2a'};padding:8px 14px;border-radius:4px;cursor:pointer;text-align:left">
+      <div style="font-weight:600">${m.k}</div>
+      <div style="font-size:11px;color:#888">${m.d}</div>
+    </button>`).join('');
+  document.body.dataset.engine = r.mode;
+  // Hide the safety-net slider when engine is PUSH (it's irrelevant).
+  const blurb = document.getElementById('tuning-blurb');
+  blurb.textContent = r.mode === 0
+    ? 'Push engine — no polling. Tweak the debounce only if you see icon-add bursts feel jittery.'
+    : 'Polling enabled. Lower the poll for snappier updates; raise it to reduce flicker.';
+}
+async function setEngine(v){
+  await fetch('/api/engine',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+v});
+  loadEngine(); loadTuning();
+}
 async function loadTuning(){
+  const eng = parseInt(document.body.dataset.engine || '0');
   const r = await fetch('/api/tuning').then(x=>x.json());
   const sliders = [
-    {key:'refresh_interval_ms', label:'Safety-net poll',  min:500, max:30000, step:250, val:r.refresh_interval_ms, suf:'ms'},
+    eng !== 0 ? {key:'refresh_interval_ms', label:'Safety-net poll',  min:500, max:30000, step:250, val:r.refresh_interval_ms, suf:'ms'} : null,
     {key:'debounce_ms',         label:'Event debounce',   min:20,  max:1000,  step:10,  val:r.debounce_ms,         suf:'ms'},
     {key:'star_anim_ms',        label:'Star animation',   min:0,   max:1500,  step:20,  val:r.star_anim_ms,        suf:'ms (0 = off)'},
-  ];
+  ].filter(Boolean);
   const wrap = document.getElementById('tuning');
   wrap.innerHTML = sliders.map(s=>`
     <label style="color:#bbb">${s.label}</label>
@@ -1412,7 +1457,7 @@ async function saveTuning(){
     map(i=>i.dataset.key+'='+i.value).join('&');
   await fetch('/api/tuning',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
 }
-load(); loadAutostart(); loadProfiles(); loadTuning();
+load(); loadAutostart(); loadProfiles(); loadEngine().then(loadTuning);
 setInterval(load, 1500);
 </script>
 )HTML";
@@ -1567,6 +1612,21 @@ static void httpHandle(SOCKET s) {
             "{\"refresh_interval_ms\":%d,\"debounce_ms\":%d,\"star_anim_ms\":%d}",
             g_refreshIntervalMs.load(), g_debounceMs.load(), g_starAnimMs.load());
         httpRespond(s, "200 OK", "application/json", j);
+    } else if (strcmp(path, "/api/engine") == 0 && strcmp(method, "GET") == 0) {
+        char j[80]; snprintf(j, sizeof(j), "{\"mode\":%d}", g_engine.load());
+        httpRespond(s, "200 OK", "application/json", j);
+    } else if (strcmp(path, "/api/engine") == 0 && strcmp(method, "POST") == 0) {
+        const char* body = strstr(buf, "\r\n\r\n");
+        if (body) {
+            const char* p = strstr(body, "mode=");
+            if (p) {
+                int v = atoi(p + 5);
+                g_engine.store(clampInt(v, 0, 2));
+                engineSave();
+                PostMessageW(g_msgWnd, WM_APP + 6, 0, 0);   // apply on main thread
+            }
+        }
+        httpRespond(s, "200 OK", "application/json", "{\"ok\":true}");
     } else if (strcmp(path, "/api/tuning") == 0 && strcmp(method, "POST") == 0) {
         const char* body = strstr(buf, "\r\n\r\n");
         if (body) {
@@ -1647,17 +1707,49 @@ static void CALLBACK winEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 }
 
 static void winEventInstall() {
-    // Install two narrow ranges instead of CREATE..NAMECHANGE so we
-    // don't even receive the noisy intermediate events.
+    if (g_winEventHook) return;
     g_winEventHook = SetWinEventHook(
         EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
         nullptr, winEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    logf("WinEvent hook installed: %p (CREATE..HIDE only — no NAMECHANGE)", g_winEventHook);
+    logf("WinEvent hook installed: %p (CREATE..HIDE only)", g_winEventHook);
 }
 static void winEventUninstall() {
     if (g_winEventHook) UnhookWinEvent(g_winEventHook);
     g_winEventHook = nullptr;
+}
+
+// ---------- ShellHook: explorer.exe pushes HSHELL_* messages to us ----------
+static bool                    g_shellHookRegistered = false;
+static void shellHookInstall() {
+    if (g_shellHookRegistered || !g_msgWnd) return;
+    g_shellHookMsg = RegisterWindowMessageW(L"SHELLHOOK");
+    ChangeWindowMessageFilterEx(g_msgWnd, g_shellHookMsg, MSGFLT_ALLOW, nullptr);
+    if (RegisterShellHookWindow(g_msgWnd)) {
+        g_shellHookRegistered = true;
+        logf("ShellHook registered (msg=%u)", g_shellHookMsg);
+    } else {
+        logf("RegisterShellHookWindow FAILED err=%lu", GetLastError());
+    }
+}
+static void shellHookUninstall() {
+    if (g_shellHookRegistered) {
+        DeregisterShellHookWindow(g_msgWnd);
+        g_shellHookRegistered = false;
+    }
+}
+
+// Apply the engine selection — install/uninstall hooks + control polling.
+static void engineApply() {
+    Engine e = (Engine)g_engine.load();
+    if (e == Engine::POLL) {
+        winEventUninstall();
+        shellHookUninstall();
+    } else {
+        winEventInstall();
+        shellHookInstall();
+    }
+    logf("engine = %s", e == Engine::PUSH ? "PUSH" : e == Engine::HYBRID ? "HYBRID" : "POLL");
 }
 
 // ---------- re-register every tray icon (used after TaskbarCreated) ----------
@@ -1679,6 +1771,16 @@ static void reRegisterAllTrayIcons() {
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (g_taskbarCreatedMsg && m == g_taskbarCreatedMsg) {
         reRegisterAllTrayIcons();
+        return 0;
+    }
+    if (g_shellHookMsg && m == g_shellHookMsg) {
+        // wParam = HSHELL_* code, lParam = HWND that triggered it.
+        int code = (int)(w & 0x7FFF);
+        if (code == HSHELL_WINDOWCREATED   || code == HSHELL_WINDOWDESTROYED ||
+            code == HSHELL_REDRAW          || code == HSHELL_FLASH           ||
+            code == HSHELL_RUDEAPPACTIVATED) {
+            SetTimer(g_msgWnd, TIMER_DEBOUNCE_REFRESH, g_debounceMs.load(), nullptr);
+        }
         return 0;
     }
     switch (m) {
@@ -1763,6 +1865,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP + 5:                  // a WinEvent fired — arm/re-arm debounce
         SetTimer(h, TIMER_DEBOUNCE_REFRESH, g_debounceMs.load(), nullptr);
         return 0;
+    case WM_APP + 6:                  // engine selection changed — re-apply
+        engineApply();
+        return 0;
     case WM_TIMER:
         if (w == TIMER_DEBOUNCE_REFRESH) {
             KillTimer(h, TIMER_DEBOUNCE_REFRESH);
@@ -1772,6 +1877,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         g_quit.store(true);
         winEventUninstall();
+        shellHookUninstall();
         masterTrayUnregister();
         unregisterAllPinned();
         // remove all our tray icons + restore any taskbar slots we hid
@@ -1837,7 +1943,7 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     logf("tuning: refresh=%dms debounce=%dms star=%dms",
          g_refreshIntervalMs.load(), g_debounceMs.load(), g_starAnimMs.load());
 
-    winEventInstall();
+    engineApply();   // installs WinEventHook + ShellHook unless engine is POLL
 
     // Load animated star frames + register the master tray icon BEFORE the
     // first refresh so the right-click menu is available immediately.
@@ -1864,14 +1970,15 @@ int APIENTRY wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
         }
     }
 
-    // Safety-net polling. Most refreshes are now event-driven (WinEventHook
-    // → debounce → refresh). This thread covers anything events miss.
+    // Safety-net polling. PURE-PUSH engine skips this entirely; HYBRID runs
+    // it as a fallback; POLL runs it as the only refresh source.
     std::thread refreshThread([]{
         while (!g_quit.load()) {
             int total = g_refreshIntervalMs.load();
             for (int i = 0; i < total / 50 && !g_quit.load(); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             if (g_quit.load()) break;
+            if (g_engine.load() == (int)Engine::PUSH) continue;  // never poll in pure push
             refreshWindows();
         }
     });
