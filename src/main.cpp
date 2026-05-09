@@ -40,8 +40,8 @@
 #include <random>
 
 // ---------- config ----------
-#define TRAYSYS_VERSION       L"0.3.5"
-#define TRAYSYS_VERSION_A      "0.3.5"
+#define TRAYSYS_VERSION       L"0.3.6"
+#define TRAYSYS_VERSION_A      "0.3.6"
 #define TIMER_DEBOUNCE_REFRESH 7
 #define REMINDER_INTERVAL_HOURS 168                 // weekly nudge
 #define PROFILE_SLOTS          5
@@ -865,11 +865,13 @@ static void refreshWindows() {
                     logf("trayAdd failed for hwnd=%p uid=%u", h, (unsigned)m.uid);
                 }
             } else {
+                // Title may have changed — update internal cache for /api/state,
+                // but do NOT push to Shell_NotifyIcon. NIM_MODIFY on every browser
+                // tab retitle causes the visible tray to flicker / reflow. The
+                // tooltip is set once at NIM_ADD; live titles are visible in the
+                // window's own title bar.
                 std::wstring t = titleOf(h);
-                if (t != it->second.title) {
-                    it->second.title = std::move(t);
-                    trayModify(it->second);
-                }
+                if (t != it->second.title) it->second.title = std::move(t);
             }
         }
 
@@ -1635,17 +1637,23 @@ static void CALLBACK winEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
                                   DWORD, DWORD) {
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
     if (!hwnd || GetWindow(hwnd, GW_OWNER) != nullptr) return;
+    // Only react to *meaningful* changes. NAMECHANGE (e.g. browser tab
+    // retitling) doesn't change anything we display and would otherwise
+    // trigger constant refresh churn.
+    if (event != EVENT_OBJECT_CREATE  && event != EVENT_OBJECT_DESTROY &&
+        event != EVENT_OBJECT_SHOW    && event != EVENT_OBJECT_HIDE) return;
     g_lastEventMs.store(nowMs());
-    // Tell the message thread to (re-)arm the debounce timer.
     PostMessageW(g_msgWnd, WM_APP + 5, 0, 0);
 }
 
 static void winEventInstall() {
+    // Install two narrow ranges instead of CREATE..NAMECHANGE so we
+    // don't even receive the noisy intermediate events.
     g_winEventHook = SetWinEventHook(
-        EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE,
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
         nullptr, winEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    logf("WinEvent hook installed: %p", g_winEventHook);
+    logf("WinEvent hook installed: %p (CREATE..HIDE only — no NAMECHANGE)", g_winEventHook);
 }
 static void winEventUninstall() {
     if (g_winEventHook) UnhookWinEvent(g_winEventHook);
